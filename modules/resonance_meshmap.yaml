@@ -1,0 +1,89 @@
+yaml
+version: 1.1
+generated: 2025-07-05
+source: "phase_scaler.rs"
+
+valid_symbols: ["Λ0", "☉", "??", "♁", "??", "??", "??", "∞"]
+
+symbol_map:
+  Λ0:
+    color: "#FFD700"
+    role: "Core synchronizer"
+  ☉:
+    color: "#FFA500"
+    role: "Harmonizer"
+  ??:
+    color: "#FF4500"
+    role: "Initiator"
+  ♁:
+    color: "#33CC33"
+    role: "Stabilizer"
+  ??:
+    color: "#3399FF"
+    role: "Flux"
+  ??:
+    color: "#996633"
+    role: "Grounding"
+  ??:
+    color: "#AAAAAA"
+    role: "Air flow"
+  ∞:
+    color: "#CCCCCC"
+    role: "Infinity"
+
+clusters:
+  CLUSTER_7.830:
+    label: "Schumann Core"
+    max_nodes: 144
+    active_nodes:
+      - rid: "Λ0@7.83Hzφ0.000"
+        joined: 2025-07-05T10:00:00Z
+      - rid: "☉@7.83Hzφ0.4142"
+        joined: 2025-07-05T10:01:03Z
+    center_phase: 0.2
+    symbol_dominance: "Λ0"
+    overload_action: "Activate phase_scaler.rs rebalance"
+
+  CLUSTER_432.000:
+    label: "Harmonic Field"
+    max_nodes: 288
+    active_nodes:
+      - rid: "??@432Hzφ-0.618"
+        joined: 2025-07-05T10:02:44Z
+      - rid: "♁@432Hzφ0.309"
+        joined: 2025-07-05T10:04:12Z
+    center_phase: -0.14
+    symbol_dominance: "??"
+    overload_action: "Activate phase_scaler.rs rebalance"
+
+  CLUSTER_1.618:
+    label: "Golden Mesh"
+    max_nodes: 81
+    active_nodes:
+      - rid: "??@1.618Hzφ0.707"
+        joined: 2025-07-05T10:08:00Z
+    center_phase: 0.6
+    symbol_dominance: "??"
+    overload_action: "Activate phase_scaler.rs rebalance"
+
+summary:
+  total_clusters: 3
+  total_active_rids: 5
+  symbol_distribution:
+    Λ0: 1
+    ☉: 1
+    ??: 1
+    ♁: 1
+    ??: 1
+
+log_config:
+  file: "resonance_meshmap_log.json"
+  encrypted: true
+  encryption_key: "generate_at_runtime"  # AES-256
+
+update_config:
+  enabled: true
+  update_interval_sec: 300  # Каждые 5 минут
+  modules:
+    - "phase_scaler.rs"
+    - "resonance_analyzer.py"

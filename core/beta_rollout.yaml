@@ -1,0 +1,94 @@
+yaml
+version: 1.1
+
+valid_symbols: ["Λ0", "☉", "??", "♁", "??", "??", "??", "∞"]
+
+phases:
+  - phase: "alpha"
+    name: "Закрытый Резонанс"
+    description: "Только для внутренних валидаторов. Проверка фаз, Λ0 и Σ(t)."
+    max_nodes: 10
+    validators_only: true
+    duration_days: 14
+    lgn_stake_required: 144.0
+    activation: manual
+    required_symbol: "Λ0"
+    tasks:
+      - "Проверка фазовой синхронизации"
+      - "Отладка rcp_engine и phase_stabilizer"
+      - "Первая фиксация Λ0 в реальных условиях"
+      - "Симуляция сбоя 50% узлов"
+    logs: "alpha_rollout_log.json"
+
+  - phase: "beta-private"
+    name: "Приватная сеть 81"
+    description: "Подключение 81 участника с проверенными RID. Первые ритуалы, распределение rLGN."
+    max_nodes: 81
+    validators_only: false
+    whitelist_required: true
+    duration_days: 21
+    lgn_stake_required: 81.0
+    activation: semi-automatic
+    required_symbol: "Λ0"
+    tasks:
+      - "Ритуальный вход через onboarding_sim.py"
+      - "Активация DAO миссий"
+      - "Проверка recall, spam_guard и scaler"
+      - "Симуляция фазового спама"
+    logs: "beta_private_log.json"
+
+  - phase: "beta-open"
+    name: "Открытый тест 1000"
+    description: "До 1000 узлов. Публичная демонстрация Σ(t), резонансных транзакций и DAO-механики."
+    max_nodes: 1000
+    validators_only: false
+    whitelist_required: false
+    duration_days: 30
+    lgn_stake_required: 0
+    activation: public
+    required_symbol: "any"
+    tasks:
+      - "Запуск фазы голосования через community_dao.yaml"
+      - "Анализ логов via resonance_feedback.py"
+      - "Публичные квесты через ritual_quest.py"
+      - "Тестирование потери 30% узлов"
+    logs: "beta_open_log.json"
+
+  - phase: "mainnet-init"
+    name: "Инициация Mainnet"
+    description: "Активация основной сети LOGOS. Поддержка >10k узлов. Подпись через Λ0 и DAO-кворум."
+    max_nodes: 10000
+    validators_only: false
+    whitelist_required: false
+    duration_days: 9999
+    lgn_stake_required: 0
+    activation: by-consensus
+    required_symbol: "Λ0"
+    dynamic_quorum:
+      enabled: true
+      node_count_thresholds:
+        1000: 0.5
+        5000: 0.4
+        10000: 0.25
+    tasks:
+      - "Формирование начального символа via auto_init_from_Λ0.py"
+      - "Рассылка маяков и сигнала Σ(t)"
+      - "Применение всех 56+ модулей в боевом режиме"
+      - "Симуляция критического сбоя (70% узлов)"
+    logs: "mainnet_init_log.json"
+
+post_launch:
+  monitoring:
+    enabled: true
+    modules:
+      - "biosphere_scanner.rs"
+      - "resonance_feedback.py"
+      - "phase_integrity.rs"
+    log_file: "post_launch_monitoring.json"
+  escalation_policy:
+    if_phase_failure: "Откат до beta-private, перезапуск с резервного Λ0"
+    if_massive_spam: "Активация tx_spam_guard.rs + lgn_recall.rs"
+    if_critical_lag: "Авто-перебалансировка через phase_scaler.rs"
+  documentation:
+    guide: "logos_beta_guide.md"
+

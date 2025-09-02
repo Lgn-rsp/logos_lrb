@@ -1,0 +1,91 @@
+yaml
+version: 1.1
+created: 2025-07-05
+authors:
+  - LOGOS Core Dev Team
+
+valid_symbols: ["Λ0", "☉", "??", "♁", "??", "??", "??", "∞"]
+
+critical_conditions:
+  - id: PHASE-DROP
+    name: "Резкое падение Σ(t)"
+    detection_module: "phase_integrity.rs"
+    response:
+      - "Заморозить входящие транзакции (tx_spam_guard.rs)"
+      - "Активировать phase_stabilizer.rs для восстановления Σ(t)"
+      - "Рассылка сигнала Λ0 через beacon_emitter.rs"
+    required_symbol: "Λ0"
+
+  - id: BIOSPHERE-ALERT
+    name: "Аномалия биосферы"
+    detection_module: "biosphere_scanner.rs"
+    response:
+      - "Отключить усилители в resonance_math.rs"
+      - "Снизить частоту вещания до 1.618 Hz"
+      - "Сбор данных через resonance_feedback.py"
+    required_symbol: "any"
+
+  - id: DISSONANT-SYMBOL-ATTACK
+    name: "Фазовая атака через недопустимые символы"
+    detection_module: "symbolic_firewall.rs"
+    response:
+      - "Блокировка offending RID через tx_spam_guard.rs"
+      - "Отзыв до 50% LGN через lgn_recall.rs"
+      - "Фиксация в logs/emergency_dissonance.json"
+    required_symbol: "Λ0"
+
+  - id: NETWORK-OVERCLOCK
+    name: "Перегрузка Σ(t) по частоте"
+    detection_module: "dynamic_balance.rs"
+    response:
+      - "Увеличить LGN_cost вдвое в dynamic_balance.rs"
+      - "Активация phase_scaler.rs для ребалансировки"
+      - "Оповещение DAO через community_dao.yaml"
+    required_symbol: "Λ0"
+
+  - id: CRITICAL-CHAOS
+    name: "Сбой более 70% узлов"
+    detection_module: "phase_intercept_guard.rs"
+    response:
+      - "Переход в фазу auto_init_from_Λ0.py"
+      - "Сброс Σ(t) до базового уровня (7.83 Hz)"
+      - "Созыв DAO-кворума с 25% порогом"
+    required_symbol: "Λ0"
+    test_scenario: "simulate_70_percent_node_failure"
+
+fallback_actions:
+  if_logos_core_fails:
+    - "Изоляция Λ0 ядра через genesis_fragment_seeds.rs"
+    - "Включение аварийной цепочки backup_nodes.json"
+    - "Восстановление через phase_backup.rs"
+  if_feedback_shows_harm:
+    - "Полное торможение Σ(t) в phase_stabilizer.rs"
+    - "Миграция в low-resonance режим (1.618 Hz)"
+    - "Обратный отчёт в DAO через resonance_feedback.py"
+
+logs:
+  directory: "logs/emergency/"
+  encrypted: true
+  encryption_key: "generate_at_runtime"  # AES-256
+  notify_admins:
+    channels:
+      - telegram: "logos_emergency_channel"
+      - email: "alerts@logos.network"
+
+check_interval_sec:
+  default: 60
+  adaptive:
+    enabled: true
+    network_activity_thresholds:
+      low: { value: 120, activity: 0.5 }
+      high: { value: 30, activity: 5.0 }
+
+rcp_override_allowed: false
+
+test_scenarios:
+  - name: "simulate_70_percent_node_failure"
+    description: "Эмуляция сбоя 70% узлов для проверки CRITICAL-CHAOS"
+    module: "phase_intercept_guard.rs"
+  - name: "simulate_biosphere_anomaly"
+    description: "Эмуляция аномалии биосферы для BIOSPHERE-ALERT"
+    module: "biosphere_scanner.rs"

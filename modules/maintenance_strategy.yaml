@@ -1,0 +1,85 @@
+yaml
+version: 1.1
+created: 2025-07-05
+authors:
+  - LOGOS Core Dev Team
+
+valid_symbols: ["Λ0", "☉", "??", "♁", "??", "??", "??", "∞"]
+
+update_channels:
+  - name: stable
+    description: "Проверенные обновления, подписанные DAO"
+    auto_deploy: false
+    approval_required: true
+    required_symbol: "Λ0"
+  - name: beta
+    description: "Тестирование новых модулей и интеграций"
+    auto_deploy: true
+    approval_required: false
+    required_symbol: "any"
+  - name: dev
+    description: "Экспериментальная среда для новых функций"
+    auto_deploy: true
+    approval_required: false
+    required_symbol: "any"
+
+rotation_policy:
+  modules:
+    restart_interval_sec:
+      default: 86400  # 24 часа
+      adaptive:
+        enabled: true
+        network_activity_thresholds:
+          low: { value: 172800, activity: 0.5 }  # 48 часов при низкой активности
+          high: { value: 43200, activity: 5.0 }  # 12 часов при высокой
+    max_failure_before_isolation: 3
+    isolation_mode:
+      enabled: true
+      trigger_modules:
+        - "rcp_engine.rs"
+        - "phase_scaler.rs"
+        - "resonance_analyzer.py"
+      test_scenarios:
+        - name: "simulate_module_failure"
+          description: "Эмуляция отказа 3+ модулей"
+
+lifecycle_hooks:
+  pre_restart:
+    - "backup_state with phase_backup.rs"
+    - "notify_admins via telegram and email"
+  post_restart:
+    - "verify Σ(t) with phase_integrity.rs"
+    - "send heartbeat to dao_monitor via community_dao.yaml"
+
+compatibility_matrix:
+  required_versions:
+    rust: ">=1.74"
+    python: ">=3.10"
+    cargo: ">=1.70"
+    serde_json: ">=1.0.96"
+    ring: ">=0.17"
+
+auto_patch:
+  enabled: true
+  modules_included:
+    - "resonance_feedback.py"
+    - "onboarding_ui.py"
+    - "symbolic_firewall.rs"
+  security_only: false
+  max_patches_per_day: 3
+
+release_schedule:
+  cadence: "monthly"
+  last_release: "2025-06-30"
+  next_scheduled: "2025-07-31"
+  lgn_budget_reserved: 888.0
+
+logs:
+  directory: "logs/maintenance/"
+  encrypted: true
+  encryption_key: "generate_at_runtime"  # AES-256
+  notify_admins:
+    channels:
+      - telegram: "logos_maintenance_channel"
+      - email: "alerts@logos.network"
+  backup_to: "phase_backup.rs"

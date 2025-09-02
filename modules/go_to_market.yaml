@@ -1,0 +1,118 @@
+yaml
+version: 1.1
+created: 2025-07-05
+authors:
+  - LOGOS Core Dev Team
+
+valid_symbols: ["Λ0", "☉", "??", "♁", "??", "??", "??", "∞"]
+
+launch_phases:
+  - name: "Genesis Outreach"
+    target: "Ранние сторонники, идеологические участники"
+    duration_days: 14
+    required_symbol: "Λ0"
+    focus:
+      - "Ритуальные миссии через ritual_quest.py"
+      - "Формирование 81 ключевого RID"
+      - "Публичное представление Λ0"
+    channels:
+      - "Telegram: logos_community_channel"
+      - "Discord: logos_resonance_server"
+      - "GitHub Issues: logos_network/repo"
+    metrics:
+      - "Количество валидных RID (rid_builder.py)"
+      - "Реакция в resonance_feedback.py"
+      - "DAO-активность (community_dao.yaml)"
+    test_campaign:
+      name: "simulate_genesis_outreach"
+      description: "Эмуляция подключения 81 RID"
+
+  - name: "LGN Liquidity Phase"
+    target: "DEX и CEX листинг"
+    duration_days: 30
+    required_symbol: "any"
+    focus:
+      - "Запуск rLGN_converter.py"
+      - "Добавление пары LGN/USDT"
+      - "Обратная конвертация через DAO-гранты"
+    exchanges:
+      - "Uniswap: ERC-20 pair"
+      - "MEXC: LGN/USDT"
+      - "Gate.io: LGN/USDT"
+    metrics:
+      - "Объем торговли LGN"
+      - "Задержки rLGN → LGN (rLGN_converter.py)"
+      - "Количество DAO-кейсов (community_dao.yaml)"
+    test_campaign:
+      name: "simulate_liquidity_launch"
+      description: "Эмуляция листинга на DEX/CEX"
+
+  - name: "Main Resonance"
+    target: "Массовый пользователь"
+    duration_days: 90
+    required_symbol: "any"
+    focus:
+      - "Образование: resonance_tutor.py"
+      - "Фаза доверия: onboarding_ui.py"
+      - "Публичные голосования в community_dao.yaml"
+    regions:
+      - name: "RU"
+        languages: ["ru"]
+      - name: "EU"
+        languages: ["en", "de", "fr"]
+      - name: "LATAM"
+        languages: ["es", "pt"]
+    metrics:
+      - "Количество успешных входов в Σ(t) (onboarding_sim.py)"
+      - "Активность в rituals (ritual_quest.py)"
+      - "Обратная связь (resonance_feedback.py)"
+    test_campaign:
+      name: "simulate_mass_adoption"
+      description: "Эмуляция 1000+ входов пользователей"
+
+education_plan:
+  modules:
+    - "resonance_tutor.py"
+    - "onboarding_ui.py"
+    - "logos_ethics.md"
+  campaigns:
+    - name: "Enter the Phase"
+      platform: "YouTube"
+      type: "Анимированное видео"
+      languages: ["en", "ru", "es"]
+    - name: "RID Drop"
+      platform: "Twitter"
+      type: "Раздача RID с фазовыми квестами"
+      languages: ["en", "ru", "es"]
+
+integration_targets:
+  wallets:
+    - name: "TrustWallet"
+      status: "Negotiation"
+    - name: "Metamask"
+      status: "Planned"
+  blockchains:
+    - "Ethereum (via symbolic_bridge.rs)"
+    - "Polkadot"
+    - "Cosmos"
+  bridges:
+    - "symbolic_bridge.rs"
+    - "legacy_migrator.rs"
+
+tracking:
+  dashboard: "resonance_analytics_frontend"
+  metrics:
+    - rid_growth
+    - lgn_volume
+    - rlg_conversion_rate
+    - dao_participation
+  log_encryption:
+    enabled: true
+    encryption_key: "generate_at_runtime"  # AES-256
+
+dao_support:
+  proposals_enabled: true
+  voting_required: true
+  quorum: 0.33
+  budget_lgn: 10888.0
+  update_frequency_days: 14
