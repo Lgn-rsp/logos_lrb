@@ -1,41 +1,23 @@
-# Rust/target
+# Rust
 target/
-**/*.rlib
-**/*.rmeta
+**/*.rs.bk
 
-# Базы и снапшоты
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node/web (если появится сборка)
+dist/
+build/
+
+# Local envs / secrets / data
+.env
+**/*.env
+/etc/logos/
+/var/lib/logos/
 *.db
 *.sqlite
-*.sqlite3
-*.wal
 *.sled
-/var/lib/logos/
-/var/lib/logos/**
-
-# Ключи/секреты
-*.key
-*.pem
-*.p12
-*.der
-*.crt
-*.csr
-/etc/logos/keys.env
-**/keys.env
-
-# Логи/времянки
-*.log
-tmp/
-*.tmp
-*.swp
-
-# Node/npm/ts
-node_modules/
-dist/
-
-# Python venv
-venv/
-.venv/
-
-# IDE
-.vscode/
-.idea/
+snapshots/
