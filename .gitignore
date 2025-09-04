@@ -1,0 +1,35 @@
+# Rust
+target/
+**/*.rlib
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Web/node (если появится)
+node_modules/
+dist/
+build/
+
+# Базы/артефакты/логи
+*.db
+*.sqlite
+*.log
+
+# Секреты/локальные env
+*.key
+*.pem
+*.p12
+.env
+configs/*.env
+infra/systemd/*keys*.conf
+
+# Временные
+/var/
+/tmp/
+
+# Снапшоты/данные
+**/snap-*.json
+**/data.sled*

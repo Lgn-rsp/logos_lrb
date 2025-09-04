@@ -1,0 +1,126 @@
+import os, json, time, asyncio
+from typing import Optional
+from web3 import Web3
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
+from prometheus_client import Counter, Gauge, start_http_server
+import aiohttp
+
+DB_URL       = "sqlite:////opt/logos/wallet-proxy/wproxy.db"
+NODE_URL     = os.environ.get("LRB_NODE_URL", "http://127.0.0.1:8080")
+BRIDGE_KEY   = os.environ.get("LRB_BRIDGE_KEY", "")
+ETH_RPC      = os.environ.get("ETH_PROVIDER_URL", "")
+USDT_ADDRESS = os.environ.get("USDT_ERC20_ADDRESS", "0xdAC17F958D2ee523a2206206994597C13D831ec7")
+CONFIRMATIONS= int(os.environ.get("ETH_CONFIRMATIONS", "6"))
+
+from sqlalchemy.orm import declarative_base
+from sqlalchemy import Column, Integer, String, BigInteger
+
+Base = declarative_base()
+class DepositMap(Base):
+    __tablename__ = "deposit_map"
+    id = Column(Integer, primary_key=True); rid = Column(String); token = Column(String); network = Column(String); address = Column(String)
+class SeenTx(Base):
+    __tablename__ = "seen_tx"
+    id = Column(Integer, primary_key=True); txid = Column(String, unique=True); rid = Column(String); token = Column(String); network = Column(String)
+class Kv(Base):
+    __tablename__ = "kv"
+    k = Column(String, primary_key=True); v = Column(String, nullable=False)
+
+engine = create_engine(DB_URL, future=True)
+
+# metrics
+SCAN_LAST_BLOCK = Gauge("scanner_last_scanned_block", "last scanned block")
+SCAN_LAG        = Gauge("scanner_block_lag", "chain head minus safe block")
+DEP_OK          = Counter("scanner_deposit_ok_total", "successful deposits")
+DEP_ERR         = Counter("scanner_deposit_err_total","failed deposits")
+
+async def http_json(method:str, url:str, body:dict=None, headers:dict=None):
+    async with aiohttp.ClientSession() as sess:
+        async with sess.request(method, url, json=body, headers=headers) as r:
+            t = await r.text()
+            try: data = json.loads(t) if t else {}
+            except: data = {"raw": t}
+            return r.status, data
+
+def kv_get(key:str, default:str="0")->str:
+    with Session(engine) as s:
+        row = s.get(Kv, key); return row.v if row else default
+def kv_set(key:str, val:str):
+    with Session(engine) as s:
+        row = s.get(Kv, key)
+        if row: row.v = val
+        else:   s.add(Kv(k=key, v=val))
+        s.commit()
+
+async def scanner():
+    if not ETH_RPC:
+        print("No ETH RPC configured; scanner idle"); 
+        while True: await asyncio.sleep(30)
+
+    w3 = Web3(Web3.HTTPProvider(ETH_RPC, request_kwargs={"timeout":10}))
+    if not w3.is_connected():
+        print("ETH RPC unreachable; scanner idle")
+        while True: await asyncio.sleep(30)
+
+    USDT = w3.eth.contract(address=Web3.to_checksum_address(USDT_ADDRESS), abi=json.loads("""
+    [
+     {"anonymous":false,"inputs":[{"indexed":true,"name":"from","type":"address"},{"indexed":true,"name":"to","type":"address"},{"indexed":false,"name":"value","type":"uint256"}],"name":"Transfer","type":"event"}
+    ]
+    """))
+    key = "last_scanned_block"
+    backoff = 1
+    while True:
+        try:
+            head = w3.eth.block_number
+            safe_to = head - CONFIRMATIONS
+            last = int(kv_get(key, "0"))
+            SCAN_LAG.set(max(0, head - safe_to))
+            if safe_to <= last:
+                await asyncio.sleep(5); continue
+
+            step = 2000
+            from_block = last + 1
+            with Session(engine) as s:
+                addr_map = {dm.address.lower(): dm for dm in s.query(DepositMap).all()}
+
+            while from_block <= safe_to:
+                to_block = min(from_block + step - 1, safe_to)
+                logs = w3.eth.get_logs({
+                    "fromBlock": from_block, "toBlock": to_block,
+                    "address": Web3.to_checksum_address(USDT_ADDRESS),
+                    "topics": [Web3.keccak(text="Transfer(address,address,uint256)")]
+                })
+                for lg in logs:
+                    to_hex = "0x"+lg["topics"][2].hex()[-40:]
+                    to_norm = Web3.to_checksum_address(to_hex).lower()
+                    dm = addr_map.get(to_norm)
+                    if not dm: continue
+                    txid = lg["transactionHash"].hex()
+                    value = int(lg["data"], 16)
+                    # идемпотентность
+                    with Session(engine) as s:
+                        if s.execute(select(SeenTx).where(SeenTx.txid==txid)).scalar_one_or_none():
+                            continue
+                        s.add(SeenTx(txid=txid, rid=dm.rid, token=dm.token, network=dm.network)); s.commit()
+                    # bridge deposit
+                    hdr = {"X-Bridge-Key": os.environ.get("LRB_BRIDGE_KEY","")}
+                    st, data = await http_json("POST", f"{NODE_URL}/bridge/deposit",
+                                               {"rid": dm.rid, "amount": value, "ext_txid": txid}, hdr)
+                    if st//100 == 2: DEP_OK.inc()
+                    else:
+                        DEP_ERR.inc()
+                        print("WARN deposit fail", txid, st, data)
+                kv_set(key, str(to_block))
+                SCAN_LAST_BLOCK.set(to_block)
+                from_block = to_block + 1
+                backoff = 1
+            await asyncio.sleep(5)
+        except Exception as e:
+            print("scanner error:", e)
+            await asyncio.sleep(min(60, backoff)); backoff = min(60, backoff*2)
+
+if __name__ == "__main__":
+    # метрики на 9101
+    start_http_server(9101)
+    asyncio.run(scanner())

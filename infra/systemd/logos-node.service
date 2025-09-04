@@ -1,0 +1,19 @@
+[Unit]
+Description=LOGOS LRB Node (Axum REST on :8080)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=root
+WorkingDirectory=/root/logos_lrb
+ExecStart=/root/logos_lrb/target/release/logos_node
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+Environment=LRB_DEV=1
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
