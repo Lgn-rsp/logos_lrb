@@ -1,0 +1,10 @@
+[Unit]
+Description=Run LOGOS snapshot every 10 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+Unit=logos-snapshot.service
+
+[Install]
+WantedBy=timers.target

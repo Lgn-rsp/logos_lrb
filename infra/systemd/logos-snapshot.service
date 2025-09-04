@@ -1,0 +1,8 @@
+[Unit]
+Description=LOGOS LRB periodic snapshot
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/logos/keys.env
+ExecStart=/usr/bin/curl -s -H "X-Admin-Key: ${LRB_ADMIN_KEY}" \
+  http://127.0.0.1:8080/admin/snapshot-file?name=snap-$(date +%%Y%%m%%dT%%H%%M%%S).json >/dev/null
