@@ -1,0 +1,17 @@
+# /etc/systemd/system/lrb-scanner.service
+[Unit]
+Description=LOGOS Wallet Scanner (USDT->rLGN)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=logos
+WorkingDirectory=/opt/logos/wallet-proxy
+EnvironmentFile=/etc/logos/proxy.env
+ExecStart=/opt/logos/wallet-proxy/venv/bin/python /opt/logos/wallet-proxy/scanner.py
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

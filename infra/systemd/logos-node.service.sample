@@ -1,0 +1,104 @@
+# /etc/systemd/system/logos-node.service
+[Unit]
+Description=LOGOS LRB Node (Axum REST on :8080)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=root
+WorkingDirectory=/root/logos_lrb
+ExecStart=/root/logos_lrb/target/release/logos_node
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+Environment=LRB_DEV=1
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
+# /etc/systemd/system/logos-node.service.d/exec.conf
+[Service]
+WorkingDirectory=/opt/logos
+ExecStart=
+ExecStart=/opt/logos/bin/logos_node
+
+# /etc/systemd/system/logos-node.service.d/keys.conf
+[Service]
+Environment=LRB_DATA_PATH=/var/lib/logos/data.sled
+Environment=LRB_NODE_KEY_PATH=/var/lib/logos/node_key
+
+# Реальные ключи
+Environment=LRB_ADMIN_KEY=0448012cf1738fd048b154a1c367cb7cb42e3fee4ab26fb04268ab91e09fb475
+Environment=LRB_BRIDGE_KEY=b294771b022226e3a9d6e21f395c7b490a7f42e1fa203cd2fbb62eb3f4718bcf
+
+# /etc/systemd/system/logos-node.service.d/override.conf
+[Service]
+# Базовые ENV (правь под себя при необходимости)
+Environment=LRB_DEV=1
+Environment=LRB_PEERS=
+Environment=LRB_QUORUM_N=1
+Environment=LRB_VALIDATORS=
+
+# Прод-тюнинг продюсера (можно менять без ребилда)
+Environment=LRB_SLOT_MS=500
+Environment=LRB_MAX_BLOCK_TX=10000
+Environment=LRB_MEMPOOL_CAP=100000
+Environment=LRB_MAX_AMOUNT=18446744073709551615
+
+# rToken-мост (лимит и ключ для бриджа)
+Environment=LRB_BRIDGE_MAX_PER_TX=10000000
+# Админ для /admin/snapshot
+
+# /etc/systemd/system/logos-node.service.d/runas.conf
+[Service]
+User=logos
+Group=logos
+# разрешаем запись в каталог данных под sandbox
+ReadWritePaths=/var/lib/logos
+
+# /etc/systemd/system/logos-node.service.d/security.conf
+[Service]
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+# Разрешаем запись ровно туда, где нужно
+ReadWritePaths=/var/lib/logos /opt/logos /etc/logos
+
+WorkingDirectory=/opt/logos
+ExecStart=
+ExecStart=/opt/logos/bin/logos_node
+
+# /etc/systemd/system/logos-node.service.d/tuning.conf
+[Service]
+Environment=LRB_SLOT_MS=500
+Environment=LRB_MAX_BLOCK_TX=10000
+Environment=LRB_MEMPOOL_CAP=100000
+Environment=LRB_MAX_AMOUNT=18446744073709551615
+
+# /etc/systemd/system/logos-node.service.d/zz-consensus.conf
+[Service]
+Environment=LRB_VALIDATORS=5Ropc1AQhzuB5uov9GJSumGWZGomE8CTvCyk8D1q1pHb
+Environment=LRB_QUORUM_N=1
+Environment=LRB_SLOT_MS=200
+
+# /etc/systemd/system/logos-node.service.d/zz-keys.conf
+[Service]
+# читаем файл с секретами (на будущее)
+EnvironmentFile=-/etc/logos/keys.env
+
+# и ПРЯМО зашиваем реальные значения, чтобы перебить любой override
+Environment=LRB_DATA_PATH=/var/lib/logos/data.sled
+Environment=LRB_NODE_KEY_PATH=/var/lib/logos/node_key
+Environment=LRB_ADMIN_KEY=0448012cf1738fd048b154a1c367cb7cb42e3fee4ab26fb04268ab91e09fb475
+Environment=LRB_BRIDGE_KEY=b294771b022226e3a9d6e21f395c7b490a7f42e1fa203cd2fbb62eb3f4718bcf
+
+# /etc/systemd/system/logos-node.service.d/zz-logging.conf
+[Service]
+Environment=RUST_LOG=info
