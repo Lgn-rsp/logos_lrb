@@ -21,3 +21,4 @@ build/
 *.sqlite
 *.sled
 snapshots/
+docs/LRB_SNAPSHOT_*.txt
