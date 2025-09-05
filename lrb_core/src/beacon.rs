@@ -2,7 +2,7 @@ use crate::types::Rid;
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::Serialize;
-use std::{time::Duration};
+use std::time::Duration;
 use tokio::time::interval;
 
 #[derive(Serialize)]
@@ -15,7 +15,9 @@ pub async fn run_beacon(rid: Rid, peers: Vec<String>, period: Duration) -> Resul
     if peers.is_empty() {
         // Нечего слать — просто спим, чтобы не грузить CPU
         let mut t = interval(period);
-        loop { t.tick().await; }
+        loop {
+            t.tick().await;
+        }
     }
     let client = Client::new();
     let mut t = interval(period);
@@ -49,7 +51,10 @@ pub fn parse_peers(env_val: &str) -> Result<Vec<String>> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    if peers.iter().any(|p| !(p.starts_with("http://") || p.starts_with("https://"))) {
+    if peers
+        .iter()
+        .any(|p| !(p.starts_with("http://") || p.starts_with("https://")))
+    {
         return Err(anyhow!("peer must start with http(s)://"));
     }
     Ok(peers)

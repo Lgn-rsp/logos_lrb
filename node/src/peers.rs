@@ -1,7 +1,20 @@
-use crate::state::now_ms;
+#![allow(dead_code)]
+#![allow(dead_code)]
+use std::time::{SystemTime, UNIX_EPOCH};
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u128)
+        .unwrap_or(0)
+}
+
 use once_cell::sync::Lazy;
 use prometheus::{register_int_gauge, IntGauge};
-use std::{collections::HashMap, sync::{Arc, Mutex}, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 static QUARANTINED_GAUGE: Lazy<IntGauge> =
     Lazy::new(|| register_int_gauge!("peers_quarantined", "quarantined peers").unwrap());
@@ -18,7 +31,13 @@ pub struct PeerScore {
 }
 impl Default for PeerScore {
     fn default() -> Self {
-        Self { last_seen_ms: now_ms(), score_milli: 0, fails: 0, dups: 0, banned_until_ms: 0 }
+        Self {
+            last_seen_ms: now_ms(),
+            score_milli: 0,
+            fails: 0,
+            dups: 0,
+            banned_until_ms: 0,
+        }
     }
 }
 
@@ -53,22 +72,33 @@ pub struct PeerBook {
     policy: PeerPolicy,
 }
 impl PeerBook {
-    pub fn new(policy: PeerPolicy) -> Self { Self { inner: Arc::new(Mutex::new(HashMap::new())), policy } }
-    fn entry_mut(&self, _pk: &str) -> std::sync::MutexGuard<'_, HashMap<String, PeerScore>> { self.inner.lock().unwrap() }
+    pub fn new(policy: PeerPolicy) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            policy,
+        }
+    }
+    fn entry_mut(&self, _pk: &str) -> std::sync::MutexGuard<'_, HashMap<String, PeerScore>> {
+        self.inner.lock().unwrap()
+    }
 
     pub fn on_success(&self, pk: &str) {
         let mut m = self.entry_mut(pk);
         let s = m.entry(pk.to_string()).or_default();
         s.last_seen_ms = now_ms();
         s.score_milli += self.policy.up_tick;
-        if s.score_milli > 5000 { s.score_milli = 5000; }
+        if s.score_milli > 5000 {
+            s.score_milli = 5000;
+        }
     }
     pub fn on_duplicate(&self, pk: &str) {
         let mut m = self.entry_mut(pk);
         let s = m.entry(pk.to_string()).or_default();
         s.dups += 1;
         s.score_milli += self.policy.dup_penalty;
-        if s.score_milli < self.policy.ban_threshold_milli { s.banned_until_ms = now_ms() + self.policy.ban_ttl_ms; }
+        if s.score_milli < self.policy.ban_threshold_milli {
+            s.banned_until_ms = now_ms() + self.policy.ban_ttl_ms;
+        }
     }
     pub fn on_invalid(&self, pk: &str) {
         let mut m = self.entry_mut(pk);
@@ -79,7 +109,9 @@ impl PeerBook {
     }
     pub fn is_quarantined(&self, pk: &str) -> bool {
         let m = self.inner.lock().unwrap();
-        m.get(pk).map(|s| now_ms() < s.banned_until_ms).unwrap_or(false)
+        m.get(pk)
+            .map(|s| now_ms() < s.banned_until_ms)
+            .unwrap_or(false)
     }
     pub fn tick(&self) {
         let mut m = self.inner.lock().unwrap();
@@ -93,7 +125,9 @@ impl PeerBook {
                     let steps = (dt as f64 / self.policy.decay_ms as f64).floor() as i64;
                     if steps > 0 {
                         s.score_milli += steps * 50; // +0.050/шаг
-                        if s.score_milli > 0 { s.score_milli = 0; }
+                        if s.score_milli > 0 {
+                            s.score_milli = 0;
+                        }
                         s.last_seen_ms = now;
                     }
                 }
@@ -105,7 +139,9 @@ impl PeerBook {
             {
                 s.banned_until_ms = 0;
             }
-            if s.banned_until_ms > now { banned += 1; }
+            if s.banned_until_ms > now {
+                banned += 1;
+            }
         }
         QUARANTINED_GAUGE.set(banned);
         PEERS_TOTAL_GAUGE.set(m.len() as i64);
@@ -114,6 +150,9 @@ impl PeerBook {
 pub fn spawn_peer_aging(book: PeerBook) {
     tokio::spawn(async move {
         let mut t = tokio::time::interval(Duration::from_millis(2000));
-        loop { t.tick().await; book.tick(); }
+        loop {
+            t.tick().await;
+            book.tick();
+        }
     });
 }

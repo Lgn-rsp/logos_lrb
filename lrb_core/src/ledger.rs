@@ -1,25 +1,32 @@
-use sled::{Db, IVec, Tree};
-use std::path::Path;
-use std::convert::TryInto;
-use serde::{Serialize, Deserialize};
-use sha2::{Digest, Sha256};
+use crate::types::*;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use crate::types::*;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use sled::{Db, IVec, Tree};
+use std::convert::TryInto;
+use std::path::Path;
 
 // key helpers
-fn be64(v: u64) -> [u8; 8] { v.to_be_bytes() }
-fn be32(v: u32) -> [u8; 4] { v.to_be_bytes() }
-fn rid_str(r: &Rid) -> &str { &r.0 }
+fn be64(v: u64) -> [u8; 8] {
+    v.to_be_bytes()
+}
+fn be32(v: u32) -> [u8; 4] {
+    v.to_be_bytes()
+}
+fn rid_str(r: &Rid) -> &str {
+    &r.0
+}
 
 #[derive(Clone)]
 pub struct Ledger {
+    #[allow(dead_code)]
     db: Db,
 
     // balances
-    lg_tree: Tree,     // rid -> u64 (BE)
-    rlgn_tree: Tree,   // rid -> u64 (BE)
-    head_tree: Tree,   // "h" (u64 BE), "hh" (String), "fin" (u64 BE)
+    lg_tree: Tree,   // rid -> u64 (BE)
+    rlgn_tree: Tree, // rid -> u64 (BE)
+    head_tree: Tree, // "h" (u64 BE), "hh" (String), "fin" (u64 BE)
 
     // history+index
     blocks_tree: Tree, // "b"|be64(height) -> StoredBlock(JSON)
@@ -58,12 +65,12 @@ impl Ledger {
     pub fn open<P: AsRef<Path>>(path: P) -> anyhow::Result<Ledger> {
         let db = sled::open(path)?;
         Ok(Ledger {
-            lg_tree:     db.open_tree("lgn")?,
-            rlgn_tree:   db.open_tree("rlgn")?,
-            head_tree:   db.open_tree("head")?,
+            lg_tree: db.open_tree("lgn")?,
+            rlgn_tree: db.open_tree("rlgn")?,
+            head_tree: db.open_tree("head")?,
             blocks_tree: db.open_tree("blocks")?,
-            tx_tree:     db.open_tree("txs")?,
-            acct_tree:   db.open_tree("acct_txs")?,
+            tx_tree: db.open_tree("txs")?,
+            acct_tree: db.open_tree("acct_txs")?,
             db,
         })
     }
@@ -71,32 +78,38 @@ impl Ledger {
     // ------- balances -------
     pub fn get_balance(&self, rid: &Rid) -> u64 {
         let k = rid_str(rid).as_bytes();
-        self.lg_tree.get(k).ok().flatten()
-            .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap_or([0u8;8])))
+        self.lg_tree
+            .get(k)
+            .ok()
+            .flatten()
+            .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap_or([0u8; 8])))
             .unwrap_or(0)
     }
     pub fn get_rbalance(&self, rid: &Rid) -> u64 {
         let k = rid_str(rid).as_bytes();
-        self.rlgn_tree.get(k).ok().flatten()
-            .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap_or([0u8;8])))
+        self.rlgn_tree
+            .get(k)
+            .ok()
+            .flatten()
+            .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap_or([0u8; 8])))
             .unwrap_or(0)
     }
-    pub fn export_balances(&self) -> anyhow::Result<Vec<(String,u64)>> {
+    pub fn export_balances(&self) -> anyhow::Result<Vec<(String, u64)>> {
         let mut out = Vec::new();
         for item in self.lg_tree.iter() {
-            let (k,v) = item?;
+            let (k, v) = item?;
             let rid = String::from_utf8(k.to_vec()).unwrap_or_default();
-            let bal = u64::from_be_bytes(v.as_ref().try_into().unwrap_or([0u8;8]));
+            let bal = u64::from_be_bytes(v.as_ref().try_into().unwrap_or([0u8; 8]));
             out.push((rid, bal));
         }
         Ok(out)
     }
-    pub fn export_rbalances(&self) -> anyhow::Result<Vec<(String,u64)>> {
+    pub fn export_rbalances(&self) -> anyhow::Result<Vec<(String, u64)>> {
         let mut out = Vec::new();
         for item in self.rlgn_tree.iter() {
-            let (k,v) = item?;
+            let (k, v) = item?;
             let rid = String::from_utf8(k.to_vec()).unwrap_or_default();
-            let bal = u64::from_be_bytes(v.as_ref().try_into().unwrap_or([0u8;8]));
+            let bal = u64::from_be_bytes(v.as_ref().try_into().unwrap_or([0u8; 8]));
             out.push((rid, bal));
         }
         Ok(out)
@@ -104,10 +117,14 @@ impl Ledger {
 
     // head/finalized
     pub fn head(&self) -> anyhow::Result<(u64, String)> {
-        let h = self.head_tree.get(b"h")?
+        let h = self
+            .head_tree
+            .get(b"h")?
             .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap()))
             .unwrap_or(0);
-        let hh = self.head_tree.get(b"hh")?
+        let hh = self
+            .head_tree
+            .get(b"hh")?
             .map(|v| String::from_utf8(v.to_vec()).unwrap())
             .unwrap_or_else(|| "".to_string());
         Ok((h, hh))
@@ -118,7 +135,9 @@ impl Ledger {
         Ok(())
     }
     pub fn get_finalized(&self) -> anyhow::Result<u64> {
-        Ok(self.head_tree.get(b"fin")?
+        Ok(self
+            .head_tree
+            .get(b"fin")?
             .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap()))
             .unwrap_or(0))
     }
@@ -144,25 +163,31 @@ impl Ledger {
     }
 
     /// индексирует блок и его транзакции
-    pub fn index_block(&self, height: u64, hash: &str, ts_ms: u128, txs: &[Tx]) -> anyhow::Result<()> {
+    pub fn index_block(
+        &self,
+        height: u64,
+        hash: &str,
+        ts_ms: u128,
+        txs: &[Tx],
+    ) -> anyhow::Result<()> {
         let mut ids = Vec::with_capacity(txs.len());
         for (i, tx) in txs.iter().enumerate() {
             let txid = Self::tx_id_of(tx);
             ids.push(txid.clone());
 
             // tx json
-            let stx = StoredTx{
+            let stx = StoredTx {
                 tx_id: txid.clone(),
                 from: rid_str(&tx.from).to_string(),
-                to:   rid_str(&tx.to).to_string(),
+                to: rid_str(&tx.to).to_string(),
                 amount: tx.amount,
-                nonce:  tx.nonce,
+                nonce: tx.nonce,
                 height,
-                index:  i as u32,
+                index: i as u32,
                 ts_ms,
             };
             // t|txid -> StoredTx
-            let mut k_tx = Vec::with_capacity(1+txid.len());
+            let mut k_tx = Vec::with_capacity(1 + txid.len());
             k_tx.extend_from_slice(b"t");
             k_tx.extend_from_slice(txid.as_bytes());
             self.tx_tree.insert(k_tx, serde_json::to_vec(&stx)?)?;
@@ -187,34 +212,54 @@ impl Ledger {
         }
 
         // b|height -> StoredBlock
-        let mut k_b = Vec::with_capacity(1+8);
+        let mut k_b = Vec::with_capacity(1 + 8);
         k_b.extend_from_slice(b"b");
         k_b.extend_from_slice(&be64(height));
-        let sblk = StoredBlock { height, hash: hash.to_string(), ts_ms, tx_ids: ids };
+        let sblk = StoredBlock {
+            height,
+            hash: hash.to_string(),
+            ts_ms,
+            tx_ids: ids,
+        };
         self.blocks_tree.insert(k_b, serde_json::to_vec(&sblk)?)?;
         Ok(())
     }
 
     pub fn get_block(&self, height: u64) -> anyhow::Result<Option<StoredBlock>> {
-        let mut k = Vec::with_capacity(1+8);
+        let mut k = Vec::with_capacity(1 + 8);
         k.extend_from_slice(b"b");
         k.extend_from_slice(&be64(height));
-        Ok(self.blocks_tree.get(k)?.map(|v| serde_json::from_slice::<StoredBlock>(&v)).transpose()?)
+        Ok(self
+            .blocks_tree
+            .get(k)?
+            .map(|v| serde_json::from_slice::<StoredBlock>(&v))
+            .transpose()?)
     }
 
     pub fn get_tx(&self, txid: &str) -> anyhow::Result<Option<StoredTx>> {
-        let mut k = Vec::with_capacity(1+txid.len());
+        let mut k = Vec::with_capacity(1 + txid.len());
         k.extend_from_slice(b"t");
         k.extend_from_slice(txid.as_bytes());
-        Ok(self.tx_tree.get(k)?.map(|v| serde_json::from_slice::<StoredTx>(&v)).transpose()?)
+        Ok(self
+            .tx_tree
+            .get(k)?
+            .map(|v| serde_json::from_slice::<StoredTx>(&v))
+            .transpose()?)
     }
 
     /// Страница истории по rid. cursor = base64(k)
-    pub fn account_txs_page(&self, rid: &str, limit: usize, cursor: Option<String>) -> anyhow::Result<AccountTxPage> {
+    pub fn account_txs_page(
+        &self,
+        rid: &str,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> anyhow::Result<AccountTxPage> {
         let lim = limit.min(100).max(1);
         let mut start_key = {
             let mut k = Vec::with_capacity(1 + rid.len() + 1);
-            k.extend_from_slice(b"a"); k.extend_from_slice(rid.as_bytes()); k.push(b'|');
+            k.extend_from_slice(b"a");
+            k.extend_from_slice(rid.as_bytes());
+            k.push(b'|');
             k
         };
         if let Some(c) = cursor {
@@ -233,29 +278,46 @@ impl Ledger {
             }
             next_cursor = Some(B64.encode(k.to_vec()));
         }
-        Ok(AccountTxPage { rid: rid.to_string(), items, next_cursor })
+        Ok(AccountTxPage {
+            rid: rid.to_string(),
+            items,
+            next_cursor,
+        })
     }
 
     // ------- мостовая идемпотентность -------
     pub fn bridge_seen_mark(&self, rk: &str) -> anyhow::Result<bool> {
         let k = format!("seen:{}", rk);
-        if self.head_tree.contains_key(k.as_bytes())? { return Ok(false); }
-        self.head_tree.insert(k.as_bytes(), IVec::from(&[1u8][..]))?;
+        if self.head_tree.contains_key(k.as_bytes())? {
+            return Ok(false);
+        }
+        self.head_tree
+            .insert(k.as_bytes(), IVec::from(&[1u8][..]))?;
         Ok(true)
     }
 
     // ------- rLGN -------
-    pub fn mint_rtoken(&self, rid:&Rid, amt:u64) -> anyhow::Result<u64> {
+    pub fn mint_rtoken(&self, rid: &Rid, amt: u64) -> anyhow::Result<u64> {
         let k = rid_str(rid).as_bytes();
-        let cur = self.rlgn_tree.get(k)?.map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap())).unwrap_or(0);
+        let cur = self
+            .rlgn_tree
+            .get(k)?
+            .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap()))
+            .unwrap_or(0);
         let newb = cur.saturating_add(amt);
         self.rlgn_tree.insert(k, &be64(newb))?;
         Ok(newb)
     }
-    pub fn burn_rtoken(&self, rid:&Rid, amt:u64) -> anyhow::Result<u64> {
+    pub fn burn_rtoken(&self, rid: &Rid, amt: u64) -> anyhow::Result<u64> {
         let k = rid_str(rid).as_bytes();
-        let cur = self.rlgn_tree.get(k)?.map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap())).unwrap_or(0);
-        if cur < amt { anyhow::bail!("insufficient rLGN"); }
+        let cur = self
+            .rlgn_tree
+            .get(k)?
+            .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap()))
+            .unwrap_or(0);
+        if cur < amt {
+            anyhow::bail!("insufficient rLGN");
+        }
         let newb = cur - amt;
         self.rlgn_tree.insert(k, &be64(newb))?;
         Ok(newb)
@@ -267,19 +329,27 @@ impl Ledger {
         for tx in blk.txs.iter() {
             // списание/зачисление LGN
             let from_k = rid_str(&tx.from).as_bytes();
-            let to_k   = rid_str(&tx.to).as_bytes();
+            let to_k = rid_str(&tx.to).as_bytes();
 
-            let from_bal = self.lg_tree.get(from_k)?
-                .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap())).unwrap_or(0);
-            if from_bal < tx.amount { anyhow::bail!("insufficient funds"); }
-            let to_bal = self.lg_tree.get(to_k)?
-                .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap())).unwrap_or(0);
+            let from_bal = self
+                .lg_tree
+                .get(from_k)?
+                .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap()))
+                .unwrap_or(0);
+            if from_bal < tx.amount {
+                anyhow::bail!("insufficient funds");
+            }
+            let to_bal = self
+                .lg_tree
+                .get(to_k)?
+                .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap()))
+                .unwrap_or(0);
 
             let new_from = from_bal - tx.amount;
-            let new_to   = to_bal.saturating_add(tx.amount);
+            let new_to = to_bal.saturating_add(tx.amount);
 
             self.lg_tree.insert(from_k, &be64(new_from))?;
-            self.lg_tree.insert(to_k,   &be64(new_to))?;
+            self.lg_tree.insert(to_k, &be64(new_to))?;
         }
         self.set_head(blk.height, &blk.block_hash)?;
         Ok(())
@@ -291,7 +361,13 @@ impl Ledger {
             Ok(BlockHeaderView { block_hash: b.hash })
         } else {
             let (head_h, head_hash) = self.head()?;
-            if h == head_h { Ok(BlockHeaderView { block_hash: head_hash }) } else { anyhow::bail!("block not found") }
+            if h == head_h {
+                Ok(BlockHeaderView {
+                    block_hash: head_hash,
+                })
+            } else {
+                anyhow::bail!("block not found")
+            }
         }
     }
 }

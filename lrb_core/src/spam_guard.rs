@@ -9,7 +9,11 @@ pub struct SpamGuard {
 
 impl SpamGuard {
     pub fn new(max_mempool: usize, max_tx_per_block: usize, max_amount: u64) -> Self {
-        Self { max_mempool, max_tx_per_block, max_amount }
+        Self {
+            max_mempool,
+            max_tx_per_block,
+            max_amount,
+        }
     }
     pub fn check_mempool(&self, cur_len: usize) -> Result<()> {
         if cur_len > self.max_mempool {
@@ -23,5 +27,7 @@ impl SpamGuard {
         }
         Ok(())
     }
-    pub fn max_block_txs(&self) -> usize { self.max_tx_per_block }
+    pub fn max_block_txs(&self) -> usize {
+        self.max_tx_per_block
+    }
 }

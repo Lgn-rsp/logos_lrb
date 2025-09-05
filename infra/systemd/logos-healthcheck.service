@@ -1,0 +1,9 @@
+[Unit]
+Description=LOGOS healthcheck (HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/default/logos-healthcheck
+ExecStart=/usr/local/bin/logos_healthcheck.sh

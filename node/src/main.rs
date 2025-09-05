@@ -1,116 +1,222 @@
-// node/src/main.rs — прод-роутер с историей/индексами и базовой инициализацией
-mod bridge;
-mod admin;
-mod fork;
-mod state;
-mod gossip;
-mod metrics;
-mod api;
-mod peers;
-
 use anyhow::Result;
 use axum::{
-    extract::DefaultBodyLimit,
+    middleware::from_fn,
     routing::{get, post},
-    Extension, Router,
+    Router,
 };
-use std::{env, net::SocketAddr, time::Duration};
-use tokio::{signal, time::interval};
+use bs58;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use once_cell::sync::OnceCell;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+use tower_http::{
+    cors::CorsLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer, trace::TraceLayer,
+};
+use tracing_subscriber::{fmt, EnvFilter};
 
-use lrb_core::*;
-use crate::state::AppState;
+use lrb_core::ledger::Ledger;
+use lrb_core::rcp_engine::engine_with_channels;
+use lrb_core::types::Rid;
+
+mod admin;
+mod api;
+mod bridge;
+mod fork;
+mod guard;
+mod metrics;
+mod openapi;
+mod peers;
+mod state;
+mod storage;
+mod version;
+
+use dashmap::DashMap;
+use parking_lot::Mutex;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub signing: SigningKey,
+    pub verifying: VerifyingKey,
+    pub rid_b58: String,
+    pub admin_key: String,
+    pub bridge_key: String,
+    pub ledger: Ledger,
+    pub store: Arc<storage::Storage>,
+    pub locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+}
+
+static APP_STATE: OnceCell<AppState> = OnceCell::new();
+
+fn load_signing_key() -> Result<SigningKey> {
+    use std::env;
+    if let Ok(hex) = env::var("LRB_NODE_SK_HEX") {
+        let bytes = hex::decode(hex.trim())?;
+        let sk = SigningKey::from_bytes(
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("bad SK len"))?,
+        );
+        return Ok(sk);
+    }
+    if let Ok(path) = env::var("LRB_NODE_SK_PATH") {
+        let data = std::fs::read(path)?;
+        let sk = SigningKey::from_bytes(
+            data.as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("bad SK len"))?,
+        );
+        return Ok(sk);
+    }
+    anyhow::bail!("missing LRB_NODE_SK_HEX or LRB_NODE_SK_PATH");
+}
+fn rid_from_vk(vk: &VerifyingKey) -> String {
+    bs58::encode(vk.as_bytes()).into_string()
+}
+fn read_env_required(n: &str) -> Result<String> {
+    let v = std::env::var(n).map_err(|_| anyhow::anyhow!(format!("missing env {}", n)))?;
+    Ok(v)
+}
+fn guard_secret(name: &str, v: &str) -> Result<()> {
+    let bad = ["CHANGE_ADMIN_KEY", "CHANGE_ME", "", "changeme", "default"];
+    if bad.iter().any(|b| v.eq_ignore_ascii_case(b)) {
+        anyhow::bail!("{} is default/empty; refuse to start", name);
+    }
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // --------- инициализация ключей/ledger/engine ----------
-    // Ключи/ledger/engine инициализируй так, как у тебя уже сделано — здесь оставляем существующую логику.
-    // Ниже только минимальные обязательные шаги, чтобы не поломать твой запуск.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,tower_http=info,axum=info"));
+    fmt().with_env_filter(filter).init();
 
-    // Открываем базу
-    let data_path = env::var("LRB_DATA_PATH").unwrap_or_else(|_| "/var/lib/logos/data.sled".to_string());
-    let ledger = Ledger::open(&data_path)?;
+    let sk = load_signing_key()?;
+    let vk = VerifyingKey::from(&sk);
+    let rid_b58 = rid_from_vk(&vk);
+    let admin_key = read_env_required("LRB_ADMIN_KEY")?;
+    let bridge_key = read_env_required("LRB_BRIDGE_KEY")?;
+    guard_secret("LRB_ADMIN_KEY", &admin_key)?;
+    guard_secret("LRB_BRIDGE_KEY", &bridge_key)?;
 
-    // ИНИЦИАЛИЗАЦИЯ ENGINE — используй фактическую функцию/конструктор, которая уже есть у тебя:
-    // предположим у тебя есть что-то вроде: let (engine, _mp) = engine_with_channels(ledger, self_rid.clone());
-    // Здесь для совместимости:
-    let (engine, _mp) = {
-        // В твоём коде уже есть построение self_rid / ключей — оставь его.
-        // Ниже упрощённый вызов: если у тебя другой — подставь свой.
-        let dummy_rid = Rid("DUMMY_RID".to_string());
-        engine_with_channels(ledger, dummy_rid)
+    let data_dir = std::env::var("LRB_DATA_DIR").unwrap_or_else(|_| "/var/lib/logos".into());
+    std::fs::create_dir_all(&data_dir).ok();
+    let ledger = Ledger::open(&data_dir)?;
+    let store_path = format!("{}/node_state", data_dir);
+    let store = Arc::new(storage::Storage::open(store_path)?);
+
+    let app_state = AppState {
+        signing: sk,
+        verifying: vk,
+        rid_b58: rid_b58.clone(),
+        admin_key,
+        bridge_key,
+        ledger: ledger.clone(),
+        store,
+        locks: Arc::new(DashMap::new()),
+    };
+    APP_STATE.set(app_state.clone()).ok();
+
+    let rid = Rid(rid_b58.clone());
+    let _engine = engine_with_channels(ledger, rid);
+
+    let allowed_origin =
+        std::env::var("LRB_WALLET_ORIGIN").unwrap_or_else(|_| "http://localhost".into());
+    let cors = {
+        let hv = allowed_origin
+            .parse::<axum::http::HeaderValue>()
+            .expect("bad LRB_WALLET_ORIGIN");
+        CorsLayer::new()
+            .allow_origin(hv)
+            .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+            .allow_headers([
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::AUTHORIZATION,
+            ])
     };
 
-    // Запуск block producer (оставляем как в твоём коде)
-    {
-        let eng = engine.clone();
-        tokio::spawn(async move {
-            let _ = eng.run_block_producer().await;
-        });
-    }
+    // Rate-limit
+    let qps: u64 = std::env::var("LRB_RATE_QPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let burst: u64 = std::env::var("LRB_RATE_BURST")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+    let rl_enabled = qps > 0 && burst > 0;
+    let bypass_cidr =
+        std::env::var("LRB_RATE_BYPASS_CIDR").unwrap_or_else(|_| "127.0.0.1/32,::1/128".into());
+    let bypass = Arc::new(guard::parse_ip_allowlist(&bypass_cidr));
+    let rl = Arc::new(guard::RateLimiter::new(qps, burst, bypass.clone()));
 
-    // Собираем AppState из твоей реализации
-    let st = AppState::new_for_router(engine.clone())?;
+    // Admin IP ACL
+    let admin_allow =
+        std::env::var("LRB_ADMIN_IP_ALLOW").unwrap_or_else(|_| "127.0.0.1/32,::1/128".into());
+    let admin_nets = Arc::new(guard::parse_ip_allowlist(&admin_allow));
 
-    // --------- Роуты (все действующие + история/индексы) ----------
-    let mut app = Router::new()
-        // базовые
+    let public = Router::new()
         .route("/healthz", get(api::healthz))
-        .route("/head",    get(api::head))
+        .route("/livez", get(api::livez))
+        .route("/readyz", get(api::readyz))
+        .route("/version", get(version::version))
+        .route("/openapi.json", get(openapi::spec))
+        .route("/metrics", get(metrics::metrics_handler))
+        .route("/head", get(api::head))
         .route("/balance/:rid", get(api::balance))
-        .route("/account/:rid/state", get(api::account_state))
-        // отправка транзакций
-        .route("/submit_tx",        post(api::submit_tx))
-        .route("/submit_tx_batch",  post(api::submit_tx_batch))
-        // отладка канона/подписи
+        .route("/history/:rid", get(api::history))
+        .route("/block/:height", get(api::block))
+        .route("/submit_tx", post(api::submit_tx))
+        .route("/submit_tx_batch", post(api::submit_tx_batch))
         .route("/debug_canon", post(api::debug_canon))
-        // faucet (DEV)
-        .route("/faucet/:rid/:amount", post(api::faucet))
-        // мост
-        .route("/bridge/deposit", post(api::bridge_deposit))
-        .route("/bridge/redeem",  post(api::bridge_redeem))
-        .route("/bridge/verify",  post(api::bridge_verify))
-        // админка
-        .route("/admin/snapshot",      get(api::snapshot))
-        .route("/admin/snapshot-file", get(api::snapshot_file))
-        .route("/admin/restore",       post(api::restore))
-        .route("/admin/token",         get(api::admin_token))
-        .route("/node/info",           get(api::node_info))
-        // НОВОЕ: история/индексы
-        .route("/block/:height", get(api::get_block))
-        .route("/tx/:id",        get(api::get_tx))
-        .route("/account/:rid/txs", get(api::account_txs))
-        // лимит тела (предохраняемся от больших batch’ей)
-        .layer(DefaultBodyLimit::max(64 * 1024))
-        .layer(Extension(st.clone()));
+        .route("/faucet", post(api::faucet));
 
-    // Фоновая метрика — обновляем chain_height/mempool_len периодически (если у тебя уже есть — оставь свою)
-    {
-        let stc = st.clone();
-        tokio::spawn(async move {
-            let mut t = interval(Duration::from_millis(500));
-            loop {
-                t.tick().await;
-                if let Ok((h, _)) = stc.engine.ledger().head() {
-                    crate::state::HEIGHT_GAUGE.set(h as i64);
-                }
-                if let Ok(f) = stc.engine.ledger().get_finalized() {
-                    crate::state::FINAL_GAUGE.set(f as i64);
-                }
-                crate::state::MEMPOOL_GAUGE.set(stc.engine.mempool_len() as i64);
-            }
-        });
+    let admin_routes = Router::new()
+        .route("/admin/snapshot", post(admin::snapshot))
+        .route("/admin/restore", post(admin::restore))
+        .route("/node/info", get(admin::node_info))
+        .layer(from_fn({
+            let nets = admin_nets.clone();
+            move |req, next| guard::admin_ip_gate(req, next, nets.clone())
+        }));
+
+    let bridge_routes = Router::new()
+        .route("/bridge/deposit", post(bridge::deposit))
+        .route("/bridge/redeem", post(bridge::redeem))
+        .route("/bridge/verify", post(bridge::verify));
+
+    let mut app = public
+        .merge(admin_routes)
+        .merge(bridge_routes)
+        .with_state(app_state)
+        .layer(cors)
+        .layer(RequestBodyLimitLayer::new(512 * 1024))
+        .layer(TimeoutLayer::new(Duration::from_secs(10)))
+        .layer(TraceLayer::new_for_http());
+
+    if rl_enabled {
+        app = app.layer(from_fn({
+            let rl = rl.clone();
+            move |req, next| guard::rate_limit_ip_gate(req, next, rl.clone())
+        }));
     }
 
-    // --------- запуск сервера ----------
-    let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
-    println!("LOGOS LRB node listening on {}", addr);
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .with_graceful_shutdown(async {
-            let _ = signal::ctrl_c().await;
-            eprintln!("shutdown...");
-        })
-        .await?;
-
+    let addr: SocketAddr = std::env::var("LRB_NODE_LISTEN")
+        .unwrap_or_else(|_| "0.0.0.0:8080".into())
+        .parse()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(
+        "logos_node listening on {} (RID={}), rate_limit={} (qps={}, burst={}), bypass={}",
+        addr,
+        rid_b58,
+        if rl_enabled { "on" } else { "off" },
+        qps,
+        burst,
+        bypass_cidr
+    );
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

@@ -9,7 +9,8 @@ pub fn verify_tx_signature(tx: &Tx) -> Result<()> {
     let sig = crate::types::parse_sig(&tx.signature)?;
     let msg = tx.canonical_bytes();
 
-    pk.verify(&msg, &sig).map_err(|e| anyhow!("bad signature: {e}"))?;
+    pk.verify(&msg, &sig)
+        .map_err(|e| anyhow!("bad signature: {e}"))?;
 
     // сверяем id
     if tx.id != tx.compute_id() {

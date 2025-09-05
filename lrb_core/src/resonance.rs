@@ -1,5 +1,5 @@
-use blake3::Hasher;
 use crate::types::{Block, Tx};
+use blake3::Hasher;
 
 /// Гармоники Λ0/Σ(t) — фиксированное «зерно» резонанса.
 const HARMONICS: &[&[u8]] = &[
@@ -24,11 +24,15 @@ fn mix_tx(hasher: &mut Hasher, tx: &Tx) {
 /// Σ-дайджест блока (hex), детерминированный и инвариантный.
 pub fn sigma_digest_block_hex(b: &Block) -> String {
     let mut h = Hasher::new();
-    for tag in HARMONICS { h.update(tag); }
+    for tag in HARMONICS {
+        h.update(tag);
+    }
     h.update(b.prev_hash.as_bytes());
     h.update(b.proposer.0.as_bytes());
     h.update(&b.height.to_le_bytes());
     h.update(&b.timestamp_ms.to_le_bytes());
-    for tx in &b.txs { mix_tx(&mut h, tx) }
+    for tx in &b.txs {
+        mix_tx(&mut h, tx)
+    }
     hex::encode(h.finalize().as_bytes())
 }

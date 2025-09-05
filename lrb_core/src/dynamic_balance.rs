@@ -7,7 +7,10 @@ pub struct DynamicBalance {
 
 impl DynamicBalance {
     pub fn new(base: u64, slope: u64) -> Self {
-        Self { base_cost_microunits: base, slope_per_tx: slope }
+        Self {
+            base_cost_microunits: base,
+            slope_per_tx: slope,
+        }
     }
     pub fn lgn_cost(&self, mempool_len: usize) -> u64 {
         self.base_cost_microunits + (self.slope_per_tx * mempool_len as u64)

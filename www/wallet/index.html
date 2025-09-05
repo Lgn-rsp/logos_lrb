@@ -1,142 +1,73 @@
 <!doctype html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>LOGOS LRB — Web Wallet</title>
-  <style>
-    :root{--bg:#0b0e12;--fg:#e8eef4;--muted:#9aa8b3;--card:#121821;--acc:#78e08f;--warn:#e77;--ok:#8f8;--link:#79a6ff}
-    *{box-sizing:border-box} body{background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,Arial,sans-serif;margin:0}
-    header{padding:18px 20px;background:#0e131a;position:sticky;top:0;border-bottom:1px solid #1f2834}
-    h1{margin:0;font-size:18px} a{color:var(--link)} main{max-width:1080px;margin:18px auto;padding:0 16px}
-    .grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
-    .card{background:var(--card);border:1px solid #1f2834;border-radius:14px;padding:16px}
-    .row{display:flex;gap:8px;flex-wrap:wrap} .mono{font-family:ui-monospace,Consolas,monospace}
-    label{display:block;margin:6px 0 2px;color:var(--muted)} input,button,select,textarea{background:#0c1219;color:var(--fg);
-      border:1px solid #243141;border-radius:10px;padding:9px 10px} input,select,textarea{width:100%}
-    button{cursor:pointer} button.primary{background:#112236;border-color:#213f66} button.ok{background:#103418;border-color:#1c5c2b}
-    .muted{color:var(--muted)} .ok{color:var(--ok)} .warn{color:var(--warn)} .kvs div{display:flex;justify-content:space-between}
-    .kvs div span:first-child{color:var(--muted)} .pill{display:inline-block;border:1px solid #2a394d;padding:2px 8px;border-radius:999px}
-    table{width:100%;border-collapse:collapse} th,td{border-bottom:1px solid #1f2834;padding:8px 6px;text-align:left}
-    .small{font-size:12px} .right{text-align:right}
-    .tabs{display:flex;gap:6px;margin-bottom:8px} .tabs button{padding:6px 10px;border-radius:8px;border:1px solid #2a394d;background:#0d141c}
-    .tabs button.active{background:#1a2635}
-  </style>
-</head>
-<body>
-  <header><h1>LOGOS LRB — Web Wallet</h1></header>
-  <main class="grid">
+<html lang="ru" data-theme="auto">
+  <head>
+    <meta charset="utf-8"/>
+    <meta http-equiv="x-ua-compatible" content="ie=edge"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>LOGOS Wallet (secure MVP)</title>
+    <link rel="stylesheet" href="./wallet.css"/>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">LOGOS Wallet</div>
+      <div class="spacer"></div>
+      <div class="endpoint"><span id="apiBase">—</span></div>
+      <button id="themeToggle" class="btn secondary" title="Тёмная/светлая тема">🌓</button>
+    </header>
 
-    <!-- Сеть / нода -->
-    <section class="card">
-      <h3>Сеть / Нода</h3>
-      <label>Node URL</label>
-      <input id="nodeUrl" placeholder="http://45.159.248.232:8080"/>
-      <div class="row">
-        <button id="saveNode" class="primary">Сохранить</button>
-        <button id="ping">Проверить /healthz</button>
-        <span id="pingRes" class="mono"></span>
-      </div>
-      <div class="kvs small" style="margin-top:8px">
-        <div><span>height</span><span id="headHeight" class="mono">-</span></div>
-        <div><span>finalized</span><span id="headFinal" class="mono">-</span></div>
-        <div><span>hash</span><span id="headHash" class="mono">-</span></div>
-      </div>
-    </section>
-
-    <!-- Ключи -->
-    <section class="card">
-      <h3>Ключи (Ed25519, локально)</h3>
-      <div class="row">
-        <button id="gen" class="primary">Сгенерировать</button>
-        <button id="wipe">Удалить из браузера</button>
-      </div>
-      <label>RID (base58)</label>
-      <div id="rid" class="mono small"></div>
-      <label>Публичный ключ (base58)</label>
-      <div id="pk58" class="mono small"></div>
-      <details style="margin-top:8px"><summary class="muted">Экспорт/импорт</summary>
-        <label>Приватный ключ (hex)</label>
-        <textarea id="skHex" rows="3" class="mono" placeholder="hex..."></textarea>
-        <div class="row"><button id="importSk">Импорт</button><button id="exportSk">Экспорт</button><span id="impRes" class="mono"></span></div>
-      </details>
-    </section>
-
-    <!-- Состояние -->
-    <section class="card">
-      <h3>Состояние аккаунта</h3>
-      <div class="row"><button id="refreshState">Обновить</button><span id="stateRes" class="mono"></span></div>
-      <div class="kvs">
-        <div><span>Баланс (μLGN)</span><span id="balance" class="mono">0</span></div>
-        <div><span>Nonce</span><span id="nonce" class="mono">0</span></div>
-      </div>
-    </section>
-
-    <!-- Перевод -->
-    <section class="card">
-      <div class="tabs"><button id="tabSend" class="active">Перевод</button><button id="tabBatch">Батч</button></div>
-
-      <div id="panelSend">
-        <label>Получатель (RID)</label><input id="toRid" placeholder="RID получателя"/>
-        <label>Сумма (μLGN)</label><input id="amount" type="number" value="1"/>
-        <div class="row"><button id="send" class="ok">Отправить</button><span id="sendRes" class="mono small"></span></div>
-      </div>
-
-      <div id="panelBatch" style="display:none">
-        <label>Список получателей (по одному RID в строке)</label>
-        <textarea id="batchList" rows="6" placeholder="RID1&#10;RID2&#10;..."></textarea>
-        <label>Сумма на каждого (μLGN)</label><input id="batchAmount" type="number" value="1"/>
-        <label>Размер батча (tx за один запрос)</label><input id="batchSize" type="number" value="50"/>
-        <div class="row"><button id="sendBatch" class="ok">Отправить батч</button><span id="batchRes" class="mono small"></span></div>
-      </div>
-    </section>
-
-    <!-- История / Недавние -->
-    <section class="card">
-      <h3>История</h3>
-      <div class="row"><button id="loadTxs">Загрузить</button><button id="nextTxs">Дальше</button><span id="histRes" class="mono small"></span></div>
-      <table id="hist"><thead><tr><th>H</th><th>Tx</th><th>Dir</th><th class="right">Amount</th><th>Counterparty</th></tr></thead><tbody></tbody></table>
-    </section>
-
-    <section class="card">
-      <h3>Недавние</h3>
-      <div class="row"><button id="recentBlocks">Блоки</button><button id="recentTxs">Tx</button><span id="recentRes" class="mono small"></span></div>
-      <table id="recent"><thead><tr><th>Тип</th><th>Данные</th></tr></thead><tbody></tbody></table>
-    </section>
-
-    <!-- Мост (для операторов/интегратора) -->
-    <section class="card">
-      <h3>rToken мост (оператор)</h3>
-      <label>X-Bridge-Key (или Bearer JWT)</label><input id="bridgeKey" placeholder="введите ключ или JWT (опц.)"/>
-      <label>RID</label><input id="bridgeRid" placeholder="RID для зачисления/списания"/>
-      <div class="row">
-        <div style="flex:1">
-          <label>Deposit (μrLGN)</label><input id="depAmount" type="number" value="1000"/>
-          <label>ext_txid</label><input id="depExt" placeholder="например, txid внешней сети"/>
-          <button id="deposit" class="primary">Deposit</button>
+    <main class="container">
+      <!-- Ключ -->
+      <section class="card">
+        <h2>Ключ и адрес</h2>
+        <div class="row">
+          <button id="gen"  class="btn">Сгенерировать ключ</button>
+          <button id="load" class="btn">Загрузить ключ</button>
+          <button id="copyRid" class="btn secondary" title="Скопировать RID">📋 RID</button>
         </div>
-        <div style="flex:1">
-          <label>Redeem (μrLGN)</label><input id="redAmount" type="number" value="500"/>
-          <label>request_id</label><input id="redReq" placeholder="уникальный ID запроса"/>
-          <button id="redeem" class="primary">Redeem</button>
+        <div class="mono mt8">RID: <span id="rid">—</span></div>
+      </section>
+
+      <!-- Учётная запись -->
+      <section class="card">
+        <h2>Учётная запись</h2>
+        <div class="row wrap">
+          <input id="acctRid" class="input grow" placeholder="RID (base58)"/>
+          <button id="getState" class="btn">Получить состояние</button>
+          <button id="devFaucet" class="btn warn" title="DEV: начислить тестовые LGN">Faucet (DEV)</button>
         </div>
-      </div>
-      <div class="small mono" id="bridgeRes"></div>
-    </section>
+        <div class="grid2 mt8">
+          <div>Баланс: <strong id="balance">0</strong></div>
+          <div>Нонс: <strong id="nonce">0</strong></div>
+        </div>
+      </section>
 
-    <!-- Админ-токен -->
-    <section class="card">
-      <h3>Админ (JWT)</h3>
-      <label>X-Admin-Key</label><input id="adminKey" placeholder="только для операторов"/>
-      <div class="row"><label class="muted">TTL (сек)</label><input id="adminTtl" type="number" value="600" style="width:120px"/>
-        <button id="mintAdminToken">Получить токен</button><span id="adminRes" class="mono small"></span></div>
-    </section>
+      <!-- Перевод -->
+      <section class="card">
+        <h2>Передача</h2>
+        <div class="row wrap">
+          <input id="toRid" class="input grow" placeholder="В RID (base58)"/>
+          <input id="amount" class="input w120" type="number" min="1" placeholder="Сумма"/>
+          <button id="send" class="btn">Отправить</button>
+        </div>
+        <pre id="txOut" class="log mt8" aria-live="polite"></pre>
+      </section>
 
-  </main>
+      <!-- История -->
+      <section class="card">
+        <h2>История</h2>
+        <div class="row wrap">
+          <input id="histRid" class="input grow" placeholder="RID (если пусто — мой)"/>
+          <input id="histFrom" class="input w120" type="number" min="0" placeholder="from nonce"/>
+          <input id="histLimit" class="input w100" type="number" min="1" value="20" placeholder="limit"/>
+          <button id="loadHist" class="btn">Загрузить</button>
+          <button id="moreHist" class="btn secondary">Показать ещё</button>
+        </div>
+        <div id="histList" class="log mt8" aria-live="polite"></div>
+      </section>
+    </main>
 
-  <!-- noble-ed25519 + bs58 CDN -->
-  <script type="module" src="https://cdn.jsdelivr.net/npm/@noble/ed25519@1.7.3/+esm"></script>
-  <script type="module" src="https://cdn.jsdelivr.net/npm/bs58@5.0.0/+esm"></script>
-  <script type="module" src="./wallet.js"></script>
-</body>
+    <footer class="statusbar" id="statusBar" aria-live="polite">Готово</footer>
+
+    <script src="./wallet.js" type="module"></script>
+  </body>
 </html>

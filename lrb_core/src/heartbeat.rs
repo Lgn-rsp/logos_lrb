@@ -32,7 +32,12 @@ impl Heartbeat {
 
     pub fn register_beat(&self, rid: Rid, now_ms: u128) {
         let mut map = self.inner.lock().unwrap();
-        map.insert(rid, HeartbeatState { last_seen_ms: now_ms });
+        map.insert(
+            rid,
+            HeartbeatState {
+                last_seen_ms: now_ms,
+            },
+        );
     }
 
     pub fn is_quarantined(&self, rid: &Rid) -> bool {
@@ -41,7 +46,9 @@ impl Heartbeat {
 
     pub fn peers_snapshot(&self) -> Vec<(Rid, u128)> {
         let map = self.inner.lock().unwrap();
-        map.iter().map(|(r, s)| (r.clone(), s.last_seen_ms)).collect()
+        map.iter()
+            .map(|(r, s)| (r.clone(), s.last_seen_ms))
+            .collect()
     }
 
     pub async fn run_monitor(self) -> Result<()> {

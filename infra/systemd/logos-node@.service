@@ -1,0 +1,23 @@
+[Unit]
+Description=LOGOS LRB Node (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=logos
+Group=logos
+WorkingDirectory=/opt/logos
+ExecStart=/opt/logos/logos_node
+EnvironmentFile=/etc/logos/node-%i.env
+
+# sandbox
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/var/lib/logos-%i
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

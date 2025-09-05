@@ -19,8 +19,12 @@ impl PhaseConsensus {
         }
     }
 
-    pub fn quorum_n(&self) -> usize { self.quorum_n }
-    pub fn finalized(&self) -> u64 { self.finalized_h }
+    pub fn quorum_n(&self) -> usize {
+        self.quorum_n
+    }
+    pub fn finalized(&self) -> u64 {
+        self.finalized_h
+    }
 
     /// Регистрируем голос. Возвращает Some((h,hash)) если по hash достигнут кворум.
     pub fn vote(&mut self, h: u64, block_hash: &str, rid_b58: &str) -> Option<(u64, String)> {
@@ -39,7 +43,8 @@ impl PhaseConsensus {
     /// Сколько голосов у конкретного (h,hash)
     #[allow(dead_code)]
     pub fn votes_for(&self, h: u64, block_hash: &str) -> usize {
-        self.votes.get(&h)
+        self.votes
+            .get(&h)
             .and_then(|m| m.get(block_hash))
             .map(|s| s.len())
             .unwrap_or(0)

@@ -1,9 +1,15 @@
-use crate::{ledger::Ledger, spam_guard::SpamGuard, dynamic_balance::DynamicBalance, types::*, phase_integrity};
-use crate::{phase_consensus::PhaseConsensus, phase_filters::block_passes_phase};
 use crate::sigpool::filter_valid_sigs_parallel;
+use crate::{dynamic_balance::DynamicBalance, ledger::Ledger, spam_guard::SpamGuard, types::*};
+use crate::{phase_consensus::PhaseConsensus, phase_filters::block_passes_phase};
 use anyhow::Result;
-use std::{sync::{Arc, Mutex}, time::{Duration, SystemTime, UNIX_EPOCH}};
-use tokio::sync::{mpsc::{UnboundedSender, unbounded_channel}, broadcast};
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::sync::{
+    broadcast,
+    mpsc::{unbounded_channel, UnboundedSender},
+};
 
 // точный монотонный ts для индексации
 fn now_ms() -> u128 {
@@ -14,10 +20,16 @@ fn now_ms() -> u128 {
 }
 
 fn env_u64(key: &str, def: u64) -> u64 {
-    std::env::var(key).ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(def)
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(def)
 }
 fn env_usize(key: &str, def: usize) -> usize {
-    std::env::var(key).ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(def)
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(def)
 }
 
 #[derive(Clone)]
@@ -37,12 +49,12 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(ledger: Ledger, proposer: Rid) -> Arc<Self> {
-        let mempool_cap   = env_u64("LRB_MEMPOOL_CAP", 100_000);
-        let max_block_tx  = env_u64("LRB_MAX_BLOCK_TX", 10_000);
-        let max_amount    = env_u64("LRB_MAX_AMOUNT",   u64::MAX/2);
-        let slot_ms       = env_u64("LRB_SLOT_MS",      500);
-        let quorum_n      = env_usize("LRB_QUORUM_N",   1);
-        let sig_workers   = env_usize("LRB_SIG_WORKERS", 4);
+        let mempool_cap = env_u64("LRB_MEMPOOL_CAP", 100_000);
+        let max_block_tx = env_u64("LRB_MAX_BLOCK_TX", 10_000);
+        let max_amount = env_u64("LRB_MAX_AMOUNT", u64::MAX / 2);
+        let slot_ms = env_u64("LRB_SLOT_MS", 500);
+        let quorum_n = env_usize("LRB_QUORUM_N", 1);
+        let sig_workers = env_usize("LRB_SIG_WORKERS", 4);
 
         let mempool: Arc<Mutex<Vec<Tx>>> = Arc::new(Mutex::new(Vec::new()));
         let (tx, rx) = unbounded_channel::<Tx>();
@@ -75,13 +87,27 @@ impl Engine {
         engine
     }
 
-    pub fn ledger(&self) -> Arc<Ledger> { self.ledger.clone() }
-    pub fn proposer(&self) -> Rid { self.proposer.clone() }
-    pub fn set_commit_notifier(&self, sender: broadcast::Sender<Block>) { *self.commit_tx.lock().unwrap() = Some(sender); }
-    pub fn check_amount_valid(&self, amount: u64) -> Result<()> { self.guard.check_amount(amount) }
-    pub fn mempool_sender(&self) -> UnboundedSender<Tx> { self.mempool_tx.clone() }
-    pub fn mempool_len(&self) -> usize { self.mempool.lock().unwrap().len() }
-    pub fn finalized_height(&self) -> u64 { self.consensus.lock().unwrap().finalized() }
+    pub fn ledger(&self) -> Arc<Ledger> {
+        self.ledger.clone()
+    }
+    pub fn proposer(&self) -> Rid {
+        self.proposer.clone()
+    }
+    pub fn set_commit_notifier(&self, sender: broadcast::Sender<Block>) {
+        *self.commit_tx.lock().unwrap() = Some(sender);
+    }
+    pub fn check_amount_valid(&self, amount: u64) -> Result<()> {
+        self.guard.check_amount(amount)
+    }
+    pub fn mempool_sender(&self) -> UnboundedSender<Tx> {
+        self.mempool_tx.clone()
+    }
+    pub fn mempool_len(&self) -> usize {
+        self.mempool.lock().unwrap().len()
+    }
+    pub fn finalized_height(&self) -> u64 {
+        self.consensus.lock().unwrap().finalized()
+    }
 
     pub fn register_vote(&self, height: u64, block_hash: &str, rid_b58: &str) -> bool {
         let mut cons = self.consensus.lock().unwrap();
@@ -105,18 +131,24 @@ impl Engine {
             // 1) забираем пачку из мемпула
             let raw = {
                 let mut mp = self.mempool.lock().unwrap();
-                if mp.is_empty() { continue; }
+                if mp.is_empty() {
+                    continue;
+                }
                 let take = self.guard.max_block_txs().min(mp.len());
                 mp.drain(0..take).collect::<Vec<Tx>>()
             };
 
             // 2) проверка подписей параллельно
             let mut valid = filter_valid_sigs_parallel(raw, self.sig_workers).await;
-            if valid.is_empty() { continue; }
+            if valid.is_empty() {
+                continue;
+            }
 
             // 3) базовые лимиты/amount
             valid.retain(|t| self.guard.check_amount(t.amount).is_ok());
-            if valid.is_empty() { continue; }
+            if valid.is_empty() {
+                continue;
+            }
 
             // 4) формируем блок (h+1)
             let (h, prev_hash) = self.ledger.head().unwrap_or((0, String::new()));

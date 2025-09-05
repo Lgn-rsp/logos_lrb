@@ -9,7 +9,10 @@ pub struct AntiReplayWindow {
 
 impl AntiReplayWindow {
     pub fn new(ttl_ms: u128) -> Self {
-        Self { ttl_ms, map: HashMap::new() }
+        Self {
+            ttl_ms,
+            map: HashMap::new(),
+        }
     }
 
     /// true, если новый (вставлен), false — если повтор/просрочен

@@ -1,0 +1,10 @@
+[Unit]
+Description=LOGOS healthcheck timer (every 1 min)
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+Unit=logos-healthcheck.service
+
+[Install]
+WantedBy=timers.target

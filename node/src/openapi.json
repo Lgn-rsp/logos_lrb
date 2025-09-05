@@ -1,0 +1,133 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "LOGOS LRB Node API", "version": "0.1.0" },
+  "servers": [{ "url": "http://{host}", "variables": { "host": { "default": "localhost:8080" } } }],
+  "paths": {
+    "/healthz": { "get": { "summary": "Liveness", "responses": { "200": { "description": "OK" } } } },
+    "/livez":   { "get": { "summary": "Liveness", "responses": { "200": { "description": "OK" } } } },
+    "/readyz":  { "get": { "summary": "Readiness", "responses": { "200": { "description": "Ready" } } } },
+    "/version": { "get": { "summary": "Build info", "responses": { "200": { "description": "JSON" } } } },
+    "/metrics": { "get": { "summary": "Prometheus metrics", "responses": { "200": { "description": "text/plain" } } } },
+
+    "/head": {
+      "get": {
+        "summary": "Chain head",
+        "responses": {
+          "200": { "description": "Height/finalized",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HeadResp" },
+            "examples": { "ok": { "value": { "height": 123, "finalized": false } } } } }
+          }
+        }
+      }
+    },
+
+    "/balance/{rid}": {
+      "get": {
+        "summary": "Account state",
+        "parameters": [{ "name": "rid", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Balance/nonce",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BalanceResp" },
+            "examples": { "ok": { "value": { "rid": "A...Z", "balance": 1000000, "nonce": 5 } } } } }
+          },
+          "404": { "description": "Unknown RID" }
+        }
+      }
+    },
+
+    "/submit_tx_batch": {
+      "post": {
+        "summary": "Submit batch of signed transactions",
+        "requestBody": { "required": true, "content": { "application/json": {
+          "schema": { "$ref": "#/components/schemas/SubmitTxBatchReq" },
+          "examples": { "one": { "value": { "txs": [
+            { "from":"A...Z","to":"B...Y","amount":1234,"nonce":6,"sig_hex":"<ed25519 hex>" }
+          ] } } } } } },
+        "responses": {
+          "200": { "description": "Accepted/rejected with details",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SubmitTxBatchResp" },
+            "examples": { "ok": { "value": {
+              "accepted": 1, "rejected": 0, "new_height": 124,
+              "results": [{ "idx": 0, "status": "accepted", "code": 0, "reason": "ok" }]
+            } } } } } }
+        }
+      }
+    },
+
+    "/debug_canon": {
+      "post": {
+        "summary": "Canonical JSON for signing (server-side canonicalization)",
+        "requestBody": { "required": true, "content": { "application/json": {
+          "schema": { "$ref": "#/components/schemas/DebugCanonReq" },
+          "examples": { "tx": { "value": { "tx": { "from":"A...Z","to":"B...Y","amount":1,"nonce":1 } } } }
+        } } },
+        "responses": { "200": {
+          "description": "Canon hex",
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DebugCanonResp" } } }
+        } }
+      }
+    },
+
+    "/faucet": {
+      "post": {
+        "summary": "DEV only. Mint LGN to RID",
+        "requestBody": { "required": true, "content": { "application/json": {
+          "schema": { "$ref": "#/components/schemas/FaucetReq" }
+        } } },
+        "responses": {
+          "200": { "description": "Granted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FaucetResp" } } } },
+          "400": { "description": "Bad request" }
+        }
+      }
+    }
+  },
+
+  "components": {
+    "schemas": {
+      "TxIn": {
+        "type": "object",
+        "required": ["from", "to", "amount", "nonce", "sig_hex"],
+        "properties": {
+          "from":   { "type": "string", "description": "RID (base58 pubkey)" },
+          "to":     { "type": "string", "description": "RID (base58 pubkey)" },
+          "amount": { "type": "integer", "format": "uint64", "minimum": 1 },
+          "nonce":  { "type": "integer", "format": "uint64" },
+          "sig_hex":{ "type": "string", "description": "Ed25519 signature hex over canonical bytes from /debug_canon" }
+        }
+      },
+
+      "SubmitTxBatchReq": { "type": "object", "required": ["txs"], "properties": { "txs": { "type": "array", "minItems": 1, "items": { "$ref": "#/components/schemas/TxIn" } } } },
+
+      "TxResult": {
+        "type": "object",
+        "required": ["idx", "status", "code", "reason"],
+        "properties": {
+          "idx":    { "type": "integer" },
+          "status": { "type": "string", "enum": ["accepted", "rejected"] },
+          "code":   { "type": "integer", "enum": [0, 400, 401, 402, 409] },
+          "reason": { "type": "string", "enum": ["ok", "bad_rid", "bad_sig", "bad_canon", "bad_nonce", "insufficient_funds"] }
+        }
+      },
+
+      "SubmitTxBatchResp": {
+        "type": "object",
+        "required": ["accepted", "rejected", "new_height", "results"],
+        "properties": {
+          "accepted":  { "type": "integer" },
+          "rejected":  { "type": "integer" },
+          "new_height":{ "type": "integer", "format": "uint64" },
+          "results":   { "type": "array", "items": { "$ref": "#/components/schemas/TxResult" } }
+        }
+      },
+
+      "HeadResp":   { "type": "object", "properties": { "height": { "type": "integer" }, "finalized": { "type": "boolean" } } },
+      "BalanceResp":{ "type": "object", "properties": { "rid": { "type": "string" }, "balance": { "type": "integer" }, "nonce": { "type": "integer" } } },
+
+      "DebugCanonReq":  { "type": "object", "properties": { "tx": { "type": "object" } } },
+      "DebugCanonResp": { "type": "object", "required": ["canon_hex"], "properties": { "canon_hex": { "type": "string" } } },
+
+      "FaucetReq":  { "type": "object", "required": ["rid", "amount"], "properties": { "rid": { "type": "string" }, "amount": { "type": "integer" } } },
+      "FaucetResp": { "type": "object", "properties": { "granted": { "type": "integer" }, "rid": { "type": "string" } } }
+    }
+  }
+}

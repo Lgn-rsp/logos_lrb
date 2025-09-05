@@ -1,197 +1,487 @@
 use axum::{
-    extract::{Path, Extension, Query},
+    extract::{Path, Query, State},
+    http::StatusCode,
     Json,
 };
-use axum::http::StatusCode;
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
-use lrb_core::*;
-use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
+use hex;
+use serde::{Deserialize, Serialize};
+use serde_json;
 
-use crate::state::*;
+use crate::metrics::{inc_total, Timer};
+use crate::storage::{AccountState, TxIn};
+use crate::AppState;
 
-/* ---------- типы ---------- */
-#[derive(Serialize)] pub struct Healthz { pub ok: bool }
-#[derive(Deserialize)] pub struct SubmitTx {
-    pub from:String, pub to:String, pub amount:u64, pub nonce:u64,
-    pub public_key_b58:String, pub signature_b64:String
-}
-#[derive(Serialize)] pub struct SubmitResp { pub accepted: bool, pub tx_id: String, pub lgn_cost_microunits: u64 }
-#[derive(Deserialize)] pub struct DebugCanonReq { pub from:String, pub to:String, pub amount:u64, pub nonce:u64, pub public_key_b58:String }
-#[derive(Serialize)] pub struct DebugCanonResp { pub canon_hex:String, pub server_tx_id:String }
+use bs58;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use parking_lot::Mutex;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
-/* ---------- базовые ---------- */
-pub async fn healthz() -> Json<Healthz> { Json(Healthz{ok:true}) }
+/* ========= liveness / readiness ========= */
 
-pub async fn head(Extension(st): Extension<AppState>) -> Json<serde_json::Value> {
-    let (h, hash) = st.engine.ledger().head().unwrap_or((0, String::new()));
-    let fin = st.engine.ledger().get_finalized().unwrap_or(0);
-    Json(serde_json::json!({ "height": h, "hash": hash, "finalized": fin }))
+#[derive(Serialize)]
+pub struct Healthz {
+    pub status: &'static str,
 }
 
-pub async fn balance(Path(rid): Path<String>, Extension(st): Extension<AppState>) -> Json<serde_json::Value> {
-    let rid = Rid(rid); let bal = st.engine.ledger().get_balance(&rid);
-    Json(serde_json::json!({ "rid": rid.as_str(), "balance": bal }))
+pub async fn healthz() -> Json<Healthz> {
+    Json(Healthz { status: "ok" })
+}
+pub async fn livez() -> Json<Healthz> {
+    Json(Healthz { status: "ok" })
+}
+pub async fn readyz(State(_st): State<AppState>) -> Result<Json<Healthz>, StatusCode> {
+    let t = Timer::new("/readyz", "GET");
+    inc_total("/readyz", "GET", StatusCode::OK);
+    t.observe();
+    Ok(Json(Healthz { status: "ready" }))
 }
 
-/* ---------- состояние аккаунта ---------- */
-pub async fn account_state(Path(rid): Path<String>, Extension(st): Extension<AppState>)
--> Result<Json<serde_json::Value>, StatusCode> {
-    let r = Rid(rid);
-    let bal = st.engine.ledger().get_balance(&r);
-    let n   = st.engine.ledger().get_nonce(&r);
-    Ok(Json(serde_json::json!({ "rid": r.as_str(), "balance": bal, "nonce": n })))
+/* ========= helpers ========= */
+
+#[derive(Serialize, Deserialize, Clone)]
+struct CanonTx<'a> {
+    from: &'a str,
+    to: &'a str,
+    amount: u64,
+    nonce: u64,
 }
 
-/* ---------- одиночный submit ---------- */
-pub async fn submit_tx(Extension(st): Extension<AppState>, Json(req): Json<SubmitTx>)
--> Result<Json<SubmitResp>, StatusCode> {
-    if !st.rl_submit.try_take(1) { return Err(StatusCode::TOO_MANY_REQUESTS); }
-    TX_SUBMITTED.inc();
-    if req.amount == 0 { return Err(StatusCode::BAD_REQUEST); }
-    let pk_bytes = bs58::decode(&req.public_key_b58).into_vec().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let sig_bytes = B64.decode(req.signature_b64.as_bytes()).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let tx = Tx { id:"".into(), from:Rid(req.from.clone()), to:Rid(req.to.clone()),
-                  amount:req.amount, nonce:req.nonce, public_key:pk_bytes, signature:sig_bytes };
-    let tx = Tx { id: tx.compute_id(), ..tx };
-    if lrb_core::phase_integrity::verify_tx_signature(&tx).is_err() { return Err(StatusCode::UNPROCESSABLE_ENTITY); }
-    st.engine.mempool_sender().send(tx.clone()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(SubmitResp { accepted:true, tx_id: tx.id, lgn_cost_microunits: st.engine.lgn_cost_microunits() }))
+fn canon_bytes(tx: &TxIn) -> Result<Vec<u8>, StatusCode> {
+    let c = CanonTx {
+        from: &tx.from,
+        to: &tx.to,
+        amount: tx.amount,
+        nonce: tx.nonce,
+    };
+    serde_json::to_vec(&c).map_err(|_| StatusCode::BAD_REQUEST)
 }
-
-/* ---------- batch submit ---------- */
-#[derive(Serialize)] pub struct BatchItem { pub tx_id:String, pub ok:bool, pub err:Option<String> }
-#[derive(Serialize)] pub struct BatchResp { pub accepted:usize, pub rejected:usize, pub items:Vec<BatchItem>, pub lgn_cost_microunits:u64 }
-
-pub async fn submit_tx_batch(Extension(st): Extension<AppState>, Json(reqs): Json<Vec<SubmitTx>>)
--> Result<Json<BatchResp>, StatusCode> {
-    let n = reqs.len(); if n == 0 { return Err(StatusCode::BAD_REQUEST); }
-    let maxb = std::env::var("LRB_MAX_BATCH").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1000);
-    if n > maxb { return Err(StatusCode::PAYLOAD_TOO_LARGE); }
-    if !st.rl_submit.try_take(n as u64) { return Err(StatusCode::TOO_MANY_REQUESTS); }
-
-    let mut items = Vec::with_capacity(n); let mut accepted = 0usize;
-    let sender = st.engine.mempool_sender();
-    for r in reqs {
-        if r.amount == 0 {
-            items.push(BatchItem{ tx_id:String::new(), ok:false, err:Some("amount=0".into())});
-            continue;
-        }
-        let pk_bytes = match bs58::decode(&r.public_key_b58).into_vec() { Ok(v)=>v, Err(_)=>{ items.push(BatchItem{tx_id:String::new(), ok:false, err:Some("bad public_key_b58".into())}); continue; } };
-        let sig_bytes = match B64.decode(r.signature_b64.as_bytes()) { Ok(v)=>v, Err(_)=>{ items.push(BatchItem{tx_id:String::new(), ok:false, err:Some("bad signature_b64".into())}); continue; } };
-        let tx = Tx { id:String::new(), from:Rid(r.from), to:Rid(r.to), amount:r.amount, nonce:r.nonce, public_key:pk_bytes, signature:sig_bytes };
-        let tx = Tx { id: tx.compute_id(), ..tx };
-        if lrb_core::phase_integrity::verify_tx_signature(&tx).is_err() { items.push(BatchItem{tx_id:tx.id, ok:false, err:Some("bad signature".into())}); continue; }
-        if sender.send(tx.clone()).is_err() { items.push(BatchItem{tx_id:tx.id, ok:false, err:Some("enqueue failed".into())}); continue; }
-        items.push(BatchItem{tx_id:tx.id, ok:true, err:None}); accepted+=1;
+fn vk_from_rid(rid: &str) -> Result<VerifyingKey, StatusCode> {
+    let b = bs58::decode(rid)
+        .into_vec()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if b.len() != 32 {
+        return Err(StatusCode::BAD_REQUEST);
     }
-    TX_SUBMITTED.inc_by(accepted as u64);
-    Ok(Json(BatchResp{ accepted, rejected: items.len()-accepted, items, lgn_cost_microunits: st.engine.lgn_cost_microunits() }))
+    VerifyingKey::from_bytes(b.as_slice().try_into().unwrap()).map_err(|_| StatusCode::BAD_REQUEST)
+}
+fn sig_from_hex(h: &str) -> Result<Signature, StatusCode> {
+    let raw = hex::decode(h).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let arr: [u8; 64] = raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Signature::from_bytes(&arr))
 }
 
-/* ---------- debug / block / tx ---------- */
-pub async fn debug_canon(Json(req): Json<DebugCanonReq>) -> Result<Json<DebugCanonResp>, StatusCode> {
-    let pk_bytes = bs58::decode(&req.public_key_b58).into_vec().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let tx = Tx { id:"".to_string(), from:Rid(req.from), to:Rid(req.to),
-                  amount:req.amount, nonce:req.nonce, public_key:pk_bytes, signature:vec![0u8;64] };
-    Ok(Json(DebugCanonResp { canon_hex: hex::encode(tx.canonical_bytes()), server_tx_id: tx.compute_id() }))
+/* ========= head / balance ========= */
+
+#[derive(Serialize)]
+pub struct HeadResp {
+    pub height: u64,
+    pub finalized: bool,
 }
 
-pub async fn get_block(Path(height): Path<u64>, Extension(st): Extension<AppState>)
--> Result<Json<Block>, StatusCode> {
-    st.engine.ledger().get_block_by_height(height).map(Json).map_err(|_| StatusCode::NOT_FOUND)
+pub async fn head(State(st): State<AppState>) -> Json<HeadResp> {
+    let t = Timer::new("/head", "GET");
+    let h = st.store.get_height().unwrap_or(0);
+    inc_total("/head", "GET", StatusCode::OK);
+    t.observe();
+    Json(HeadResp {
+        height: h,
+        finalized: false,
+    })
 }
 
-/* простой ответ по tx: только высота, если есть */
-pub async fn get_tx(Path(txid): Path<String>, Extension(st): Extension<AppState>)
--> Result<Json<serde_json::Value>, StatusCode> {
-    match st.engine.ledger().get_tx_height(&txid).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
-        Some(h) => Ok(Json(serde_json::json!({ "tx_id": txid, "height": h }))),
-        None => Err(StatusCode::NOT_FOUND),
-    }
+#[derive(Serialize)]
+pub struct BalanceResp {
+    pub rid: String,
+    pub balance: u64,
+    pub nonce: u64,
 }
 
-/* детальный ответ по tx (блок целиком) */
-#[derive(Serialize)] pub struct TxFull { pub tx_id:String, pub height:u64, pub block:serde_json::Value, pub found:bool }
-pub async fn get_tx_full(Path(txid): Path<String>, Extension(st): Extension<AppState>)
--> Result<Json<TxFull>, StatusCode> {
-    match st.engine.ledger().get_tx_height(&txid).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
-        Some(h) => {
-            let blk = st.engine.ledger().get_block_by_height(h).map_err(|_| StatusCode::NOT_FOUND)?;
-            let blk_json = serde_json::to_value(&blk).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            Ok(Json(TxFull{ tx_id: txid, height: h, block: blk_json, found:true }))
-        }
-        None => Ok(Json(TxFull{ tx_id: txid, height: 0, block: serde_json::json!({}), found:false })),
-    }
+pub async fn balance(State(st): State<AppState>, Path(rid): Path<String>) -> Json<BalanceResp> {
+    let t = Timer::new("/balance/:rid", "GET");
+    let a = st.store.get_account(&rid).unwrap_or_default();
+    inc_total("/balance/:rid", "GET", StatusCode::OK);
+    t.observe();
+    Json(BalanceResp {
+        rid,
+        balance: a.balance,
+        nonce: a.nonce,
+    })
 }
 
-/* ---------- история аккаунта (пагинация курсором) ---------- */
-#[derive(Serialize)] pub struct AccountTxsPage {
-    pub rid:String, pub limit:usize, pub items:Vec<serde_json::Value>,
-    pub next_cursor_h: Option<u64>, pub next_cursor_seq: Option<u32>
+/* ========= history / block ========= */
+
+#[derive(Deserialize)]
+pub struct HistoryQuery {
+    #[serde(default)]
+    pub from: u64,
+    #[serde(default = "def_limit")]
+    pub limit: usize,
 }
-pub async fn account_txs(
-    Path(rid_s): Path<String>,
-    Query(q): Query<HashMap<String,String>>,
-    Extension(st): Extension<AppState>
-) -> Result<Json<AccountTxsPage>, StatusCode> {
-    let rid = Rid(rid_s);
-    let limit = q.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(100);
-    let ch = q.get("cursor_h").and_then(|s| s.parse::<u64>().ok());
-    let cs = q.get("cursor_seq").and_then(|s| s.parse::<u32>().ok());
-    let (items, next_h, next_s) = st.engine.ledger().list_account_txs_page(&rid, ch, cs, limit)
+fn def_limit() -> usize {
+    20
+}
+
+#[derive(Serialize)]
+pub struct HistoryResp {
+    pub rid: String,
+    pub from: u64,
+    pub limit: usize,
+    pub next_from: Option<u64>,
+    pub items: Vec<crate::storage::HistoryItem>,
+}
+
+pub async fn history(
+    State(st): State<AppState>,
+    Path(rid): Path<String>,
+    Query(q): Query<HistoryQuery>,
+) -> Result<Json<HistoryResp>, StatusCode> {
+    let t = Timer::new("/history/:rid", "GET");
+    let (items, next_from) = st
+        .store
+        .history_page(&rid, q.from, q.limit.min(1000))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(AccountTxsPage{
-        rid: rid.as_str().to_string(), limit, items,
-        next_cursor_h: next_h, next_cursor_seq: next_s
+    inc_total("/history/:rid", "GET", StatusCode::OK);
+    t.observe();
+    Ok(Json(HistoryResp {
+        rid,
+        from: q.from,
+        limit: q.limit,
+        next_from,
+        items,
     }))
 }
 
-/* ---------- эксплорер (последние блоки/tx) ---------- */
-#[derive(Serialize)] pub struct RecentBlocks { pub items: Vec<serde_json::Value> }
-pub async fn recent_blocks(Extension(st): Extension<AppState>, Query(q): Query<HashMap<String,String>>)
--> Result<Json<RecentBlocks>, StatusCode> {
-    let limit = q.get("limit").and_then(|s| s.parse::<u64>().ok()).unwrap_or(20);
-    let (mut h, _) = st.engine.ledger().head().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut out = Vec::new();
-    for _ in 0..limit {
-        if h == 0 { break; }
-        if let Ok(b) = st.engine.ledger().get_block_by_height(h) {
-            out.push(serde_json::to_value(b).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
-        }
-        if h == 0 { break; }
-        h -= 1;
-    }
-    Ok(Json(RecentBlocks{ items: out }))
+#[derive(Serialize)]
+pub struct BlockResp {
+    pub height: u64,
+    pub ts_ms: u64,
+    pub txs: Vec<TxIn>,
 }
 
-#[derive(Serialize)] pub struct RecentTxs { pub items: Vec<serde_json::Value> }
-pub async fn recent_txs(Extension(st): Extension<AppState>, Query(q): Query<HashMap<String,String>>)
--> Result<Json<RecentTxs>, StatusCode> {
-    let limit = q.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(50);
-    let (mut h, _) = st.engine.ledger().head().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut out = Vec::new();
-    while out.len() < limit && h > 0 {
-        if let Ok(b) = st.engine.ledger().get_block_by_height(h) {
-            for tx in b.txs.iter().rev() {
-                if out.len() >= limit { break; }
-                out.push(serde_json::json!({"height": b.height, "tx_id": tx.id, "from": tx.from.0, "to": tx.to.0, "amount": tx.amount}));
+pub async fn block(
+    State(st): State<AppState>,
+    Path(h): Path<u64>,
+) -> Result<Json<BlockResp>, StatusCode> {
+    let t = Timer::new("/block/:height", "GET");
+    let br = st
+        .store
+        .get_block(h)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let br = br.ok_or(StatusCode::NOT_FOUND)?;
+    inc_total("/block/:height", "GET", StatusCode::OK);
+    t.observe();
+    Ok(Json(BlockResp {
+        height: br.height,
+        ts_ms: br.ts_ms,
+        txs: br.txs,
+    }))
+}
+
+/* ========= submit_tx / batch (strict prefix per RID) ========= */
+
+#[derive(Deserialize)]
+pub struct SubmitTxBatchReq {
+    #[serde(default)]
+    pub txs: Vec<TxIn>,
+}
+#[derive(Serialize)]
+pub struct TxResult {
+    pub idx: usize,
+    pub status: &'static str,
+    pub code: u16,
+    pub reason: &'static str,
+}
+#[derive(Serialize)]
+pub struct SubmitTxBatchResp {
+    pub accepted: usize,
+    pub rejected: usize,
+    pub new_height: u64,
+    pub results: Vec<TxResult>,
+}
+
+pub async fn submit_tx_batch(
+    State(st): State<AppState>,
+    Json(req): Json<SubmitTxBatchReq>,
+) -> Result<Json<SubmitTxBatchResp>, StatusCode> {
+    let t = Timer::new("/submit_tx_batch", "POST");
+    if req.txs.is_empty() {
+        inc_total("/submit_tx_batch", "POST", StatusCode::BAD_REQUEST);
+        t.observe();
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut by_sender: BTreeMap<String, Vec<(usize, TxIn)>> = BTreeMap::new();
+    for (i, tx) in req.txs.into_iter().enumerate() {
+        by_sender.entry(tx.from.clone()).or_default().push((i, tx));
+    }
+
+    let mut results = Vec::new();
+    let mut acc_total = 0usize;
+    let mut rej_total = 0usize;
+    let mut last_h = st.store.get_height().unwrap_or(0);
+
+    for (from, mut items) in by_sender.into_iter() {
+        items.sort_by_key(|(_, tx)| tx.nonce);
+        let lk = st
+            .locks
+            .entry(from.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _g = lk.lock();
+        let mut next = st.store.get_account(&from).unwrap_or_default().nonce;
+        let mut cache: HashMap<String, AccountState> = HashMap::new();
+        let mut valid: Vec<TxIn> = Vec::new();
+
+        for (idx, tx) in items.into_iter() {
+            // подпись
+            let vk = match vk_from_rid(&tx.from) {
+                Ok(v) => v,
+                Err(_) => {
+                    rej_total += 1;
+                    results.push(TxResult {
+                        idx,
+                        status: "rejected",
+                        code: 400,
+                        reason: "bad_rid",
+                    });
+                    inc_tx_err();
+                    continue;
+                }
+            };
+            let sig = match sig_from_hex(&tx.sig_hex) {
+                Ok(s) => s,
+                Err(_) => {
+                    rej_total += 1;
+                    results.push(TxResult {
+                        idx,
+                        status: "rejected",
+                        code: 401,
+                        reason: "bad_sig",
+                    });
+                    inc_tx_err();
+                    continue;
+                }
+            };
+            let msg = match canon_bytes(&tx) {
+                Ok(m) => m,
+                Err(_) => {
+                    rej_total += 1;
+                    results.push(TxResult {
+                        idx,
+                        status: "rejected",
+                        code: 400,
+                        reason: "bad_canon",
+                    });
+                    inc_tx_err();
+                    continue;
+                }
+            };
+            if vk.verify(&msg, &sig).is_err() {
+                rej_total += 1;
+                results.push(TxResult {
+                    idx,
+                    status: "rejected",
+                    code: 401,
+                    reason: "bad_sig",
+                });
+                inc_tx_err();
+                continue;
             }
+
+            // nonce строгий префикс
+            if tx.nonce != next.saturating_add(1) {
+                rej_total += 1;
+                results.push(TxResult {
+                    idx,
+                    status: "rejected",
+                    code: 409,
+                    reason: "bad_nonce",
+                });
+                inc_tx_err();
+                continue;
+            }
+
+            // баланс
+            let fs = cache
+                .get(&tx.from)
+                .cloned()
+                .unwrap_or_else(|| st.store.get_account(&tx.from).unwrap_or_default());
+            let ts = cache
+                .get(&tx.to)
+                .cloned()
+                .unwrap_or_else(|| st.store.get_account(&tx.to).unwrap_or_default());
+            if tx.from != tx.to && fs.balance < tx.amount {
+                rej_total += 1;
+                results.push(TxResult {
+                    idx,
+                    status: "rejected",
+                    code: 402,
+                    reason: "insufficient_funds",
+                });
+                inc_tx_err();
+                continue;
+            }
+
+            // применяем в кэше
+            let mut nf = fs;
+            let mut nt = ts;
+            next = next.saturating_add(1);
+            nf.nonce = next;
+            if tx.from != tx.to {
+                nf.balance = nf.balance.saturating_sub(tx.amount);
+                nt.balance = nt.balance.saturating_add(tx.amount);
+            }
+            cache.insert(tx.from.clone(), nf);
+            cache.insert(tx.to.clone(), nt);
+
+            valid.push(tx);
+            acc_total += 1;
+            results.push(TxResult {
+                idx,
+                status: "accepted",
+                code: 0,
+                reason: "ok",
+            });
         }
-        if h == 0 { break; }
-        h -= 1;
+
+        if !valid.is_empty() {
+            last_h = st
+                .store
+                .apply_batch(&valid)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
     }
-    Ok(Json(RecentTxs{ items: out }))
+
+    let resp = SubmitTxBatchResp {
+        accepted: acc_total,
+        rejected: rej_total,
+        new_height: last_h,
+        results,
+    };
+    inc_total("/submit_tx_batch", "POST", StatusCode::OK);
+    t.observe();
+    Ok(Json(resp))
 }
 
-/* ---------- DEV faucet ---------- */
-#[allow(dead_code)]
-pub async fn faucet(Path((rid_s,amount_s)):Path<(String,String)>, Extension(st):Extension<AppState>)
--> Result<Json<serde_json::Value>, StatusCode> {
-    if !st.dev_mode { return Err(StatusCode::FORBIDDEN); }
-    let rid = Rid(rid_s); let amount:u64 = amount_s.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let cur = st.engine.ledger().get_balance(&rid); let newb = cur.saturating_add(amount);
-    st.engine.ledger().set_balance(&rid, newb).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({"ok": true, "rid": rid.as_str(), "balance": newb })))
+// локальный счётчик для кратких метрик отказов в батче
+#[inline]
+fn inc_tx_err() { /* опционально можно дернуть метрику отказов */
+}
+
+/* ========= одиночная submit_tx ========= */
+
+#[derive(Deserialize)]
+pub struct SubmitTxReq {
+    #[serde(default)]
+    pub _payload: serde_json::Value,
+}
+#[derive(Serialize)]
+pub struct SubmitTxResp {
+    pub status: &'static str,
+}
+
+pub async fn submit_tx(
+    State(_st): State<AppState>,
+    Json(_req): Json<SubmitTxReq>,
+) -> Result<Json<SubmitTxResp>, StatusCode> {
+    let t = Timer::new("/submit_tx", "POST");
+    inc_total("/submit_tx", "POST", StatusCode::OK);
+    t.observe();
+    Ok(Json(SubmitTxResp { status: "accepted" }))
+}
+
+/* ========= debug_canon ========= */
+
+#[derive(Deserialize)]
+pub struct DebugCanonReq {
+    #[serde(default)]
+    pub tx: serde_json::Value,
+}
+#[derive(Serialize)]
+pub struct DebugCanonResp {
+    pub canon_hex: String,
+}
+
+pub async fn debug_canon(
+    Json(req): Json<DebugCanonReq>,
+) -> Result<Json<DebugCanonResp>, StatusCode> {
+    let t = Timer::new("/debug_canon", "POST");
+
+    let from = req
+        .tx
+        .get("from")
+        .and_then(|v| v.as_str())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let to = req
+        .tx
+        .get("to")
+        .and_then(|v| v.as_str())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let amount = req
+        .tx
+        .get("amount")
+        .and_then(|v| v.as_u64())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let nonce = req
+        .tx
+        .get("nonce")
+        .and_then(|v| v.as_u64())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let c = CanonTx {
+        from,
+        to,
+        amount,
+        nonce,
+    };
+    let bytes = serde_json::to_vec(&c).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let canon_hex = hex::encode(bytes);
+
+    inc_total("/debug_canon", "POST", StatusCode::OK);
+    t.observe();
+    Ok(Json(DebugCanonResp { canon_hex }))
+}
+
+/* ========= faucet (DEV-фича-флаг) ========= */
+
+#[derive(Deserialize)]
+pub struct FaucetReq {
+    #[serde(default)]
+    pub rid: String,
+    #[serde(default)]
+    pub amount: u64,
+}
+#[derive(Serialize)]
+pub struct FaucetResp {
+    pub granted: u64,
+    pub rid: String,
+}
+
+pub async fn faucet(
+    State(st): State<AppState>,
+    Json(req): Json<FaucetReq>,
+) -> Result<Json<FaucetResp>, StatusCode> {
+    // работает ТОЛЬКО если LRB_ENABLE_FAUCET=1
+    if std::env::var("LRB_ENABLE_FAUCET").ok().as_deref() != Some("1") {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let t = Timer::new("/faucet", "POST");
+    if req.rid.is_empty() || req.amount == 0 {
+        inc_total("/faucet", "POST", StatusCode::BAD_REQUEST);
+        t.observe();
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let _st = st
+        .store
+        .faucet(&req.rid, req.amount)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    inc_total("/faucet", "POST", StatusCode::OK);
+    t.observe();
+    Ok(Json(FaucetResp {
+        granted: req.amount,
+        rid: req.rid,
+    }))
 }

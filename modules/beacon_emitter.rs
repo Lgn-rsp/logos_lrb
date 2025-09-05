@@ -1,194 +1,139 @@
-// LOGOS Beacon Emitter — Λ0 Signal Broadcaster
-// Автор: LOGOS Core Dev
+use axum::{
+    extract::State,
+    routing::{get, post},
+    Router,
+};
+use std::{net::SocketAddr, time::Duration};
+use tower::{ServiceBuilder};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    trace::TraceLayer,
+    timeout::TimeoutLayer,
+    limit::{RequestBodyLimitLayer},
+};
+use tracing_subscriber::{EnvFilter, fmt};
+use ed25519_dalek::{SigningKey, VerifyingKey, SignatureError};
+use rand_core::OsRng;
+use bs58;
+use once_cell::sync::OnceCell;
+use anyhow::Result;
 
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::collections::{HashMap, HashSet};
-use serde::{Serialize, Deserialize};
-use serde_json;
-use ring::aead::{Aead, Nonce, UnboundKey, AES_256_GCM};
+mod api;
+mod admin;
+mod bridge;
+mod gossip;
+mod state;
+mod peers;
+mod fork;
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BeaconSignal {
-    pub symbol: String,
-    pub frequency: f64,
-    pub phase: f64,
-    pub timestamp: u64,
-    pub channel: String, // "file", "radio", "json", "stdout", "lora", "ble", "satellite"
+#[derive(Clone)]
+struct AppState {
+    signing: SigningKey,
+    verifying: VerifyingKey,
+    rid_b58: String,
+    admin_key: String,
+    bridge_key: String,
 }
 
-pub struct BeaconEmitter {
-    pub default_symbol: String,
-    pub default_freq: f64,
-    pub default_phase: f64,
-    pub channels: Vec<String>,
-    pub log_file: String,
-    pub last_emit_time: u64,
-    pub min_interval_sec: u64,
-    pub valid_symbols: HashSet<String>,
-    pub cipher_key: Vec<u8>, // Ключ для AES-256
+static APP_STATE: OnceCell<AppState> = OnceCell::new();
+
+fn load_signing_key() -> Result<SigningKey> {
+    use std::env;
+    if let Ok(hex) = env::var("LRB_NODE_SK_HEX") {
+        let bytes = hex::decode(hex.trim())?;
+        let sk = SigningKey::from_bytes(bytes.as_slice().try_into().map_err(|_| anyhow::anyhow!("bad SK len"))?);
+        return Ok(sk);
+    }
+    if let Ok(path) = env::var("LRB_NODE_SK_PATH") {
+        let data = std::fs::read(path)?;
+        let sk = SigningKey::from_bytes(data.as_slice().try_into().map_err(|_| anyhow::anyhow!("bad SK len"))?);
+        return Ok(sk);
+    }
+    anyhow::bail!("missing LRB_NODE_SK_HEX or LRB_NODE_SK_PATH");
 }
 
-impl BeaconEmitter {
-    pub fn new() -> Self {
-        let mut valid_symbols = HashSet::new();
-        valid_symbols.insert("☉".to_string());
-        valid_symbols.insert("??".to_string());
-        valid_symbols.insert("♁".to_string());
-        valid_symbols.insert("??".to_string());
-        valid_symbols.insert("??".to_string());
-        valid_symbols.insert("??".to_string());
-        valid_symbols.insert("Λ0".to_string());
-        valid_symbols.insert("∞".to_string());
+fn rid_from_vk(vk: &VerifyingKey) -> String {
+    bs58::encode(vk.as_bytes()).into_string()
+}
 
-        BeaconEmitter {
-            default_symbol: "Λ0".to_string(),
-            default_freq: 7.83,
-            default_phase: 0.0,
-            channels: vec!["file".to_string(), "stdout".to_string(), "lora".to_string(), "ble".to_string(), "satellite".to_string()],
-            log_file: "beacon_emitter_log.json".to_string(),
-            last_emit_time: 0,
-            min_interval_sec: 60,
-            valid_symbols,
-            cipher_key: vec![0u8; 32], // Заглушка, в продакшене безопасный ключ
-        }
+fn read_env_required(n: &str) -> Result<String> {
+    let v = std::env::var(n).map_err(|_| anyhow::anyhow!("missing env {}", n))?;
+    Ok(v)
+}
+
+fn guard_secret(name: &str, v: &str) -> Result<()> {
+    let bad = ["CHANGE_ADMIN_KEY","CHANGE_ME","", "changeme", "default"];
+    if bad.iter().any(|b| v.eq_ignore_ascii_case(b)) {
+        anyhow::bail!("{} is default/empty; refuse to start", name);
     }
+    Ok(())
+}
 
-    pub fn validate_parameters(&self, symbol: &str, frequency: f64, phase: f64) -> bool {
-        // Проверка символа, частоты и фазы
-        self.valid_symbols.contains(symbol) &&
-        (0.1 <= frequency && frequency <= 10000.0) &&
-        (-std::f64::consts::PI..=std::f64::consts::PI).contains(&phase)
-    }
+#[tokio::main]
+async fn main() -> Result<()> {
+    // tracing
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,tower_http=info,axum=info"));
+    fmt().with_env_filter(filter).init();
 
-    pub fn emit(&mut self) -> bool {
-        let now = Self::current_time();
-        if now - self.last_emit_time < self.min_interval_sec {
-            self.log_event("[SKIP] Beacon too frequent");
-            return false;
-        }
+    // keys + env
+    let sk = load_signing_key()?;
+    let vk = VerifyingKey::from(&sk);
+    let rid = rid_from_vk(&vk);
 
-        // Проверка параметров
-        if !self.validate_parameters(&self.default_symbol, self.default_freq, self.default_phase) {
-            self.log_event(&format!(
-                "[!] Недопустимые параметры: symbol={}, freq={}, phase={}",
-                self.default_symbol, self.default_freq, self.default_phase
-            ));
-            return false;
-        }
+    let admin_key = read_env_required("LRB_ADMIN_KEY")?;
+    let bridge_key = read_env_required("LRB_BRIDGE_KEY")?;
+    guard_secret("LRB_ADMIN_KEY", &admin_key)?;
+    guard_secret("LRB_BRIDGE_KEY", &bridge_key)?;
 
-        // Проверка через RCP (заглушка)
-        if !self.validate_with_rcp() {
-            self.log_event("[!] RCP не подтвердил сигнал");
-            return false;
-        }
+    let state = AppState {
+        signing: sk,
+        verifying: vk,
+        rid_b58: rid.clone(),
+        admin_key,
+        bridge_key,
+    };
+    APP_STATE.set(state.clone()).unwrap();
 
-        for ch in &self.channels {
-            let signal = BeaconSignal {
-                symbol: self.default_symbol.clone(),
-                frequency: self.default_freq,
-                phase: self.default_phase,
-                timestamp: now,
-                channel: ch.clone(),
-            };
+    // CORS
+    let cors = {
+        let allowed_origin = std::env::var("LRB_WALLET_ORIGIN").unwrap_or_else(|_| String::from("https://wallet.example"));
+        CorsLayer::new()
+            .allow_origin(allowed_origin.parse::<axum::http::HeaderValue>().unwrap())
+            .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+            .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION])
+    };
 
-            match ch.as_str() {
-                "file" => self.write_to_file(&signal),
-                "stdout" => println!("[BEACON] {} @ {}Hz φ = {:.4}", signal.symbol, signal.frequency, signal.phase),
-                "json" => self.export_to_json(&signal),
-                "lora" => self.emit_to_lora(&signal), // Заглушка для LoRa
-                "ble" => self.emit_to_ble(&signal),   // Заглушка для BLE
-                "satellite" => self.emit_to_satellite(&signal), // Заглушка для satellite
-                _ => self.log_event(&format!("[WARN] Unsupported channel: {}", ch)),
-            }
-        }
+    // limits/timeout
+    let layers = ServiceBuilder::new()
+        .layer(TraceLayer::new_for_http())
+        .layer(TimeoutLayer::new(Duration::from_secs(10)))
+        .layer(RequestBodyLimitLayer::new(512 * 1024)) // 512 KiB
+        .layer(cors)
+        .into_inner();
 
-        self.last_emit_time = now;
-        self.log_event(&format!(
-            "[BEACON] Emitted: {} @ {}Hz φ={:.4} on channels: {:?}", 
-            self.default_symbol, self.default_freq, self.default_phase, self.channels
-        ));
-        true
-    }
+    // маршруты
+    let app = Router::new()
+        .route("/healthz", get(api::healthz))
+        .route("/head", get(api::head))
+        .route("/balance/:rid", get(api::balance))
+        .route("/submit_tx", post(api::submit_tx))
+        .route("/submit_tx_batch", post(api::submit_tx_batch))
+        .route("/debug_canon", post(api::debug_canon))
+        .route("/faucet", post(api::faucet)) // dev-only
+        .route("/bridge/deposit", post(bridge::deposit))
+        .route("/bridge/redeem", post(bridge::redeem))
+        .route("/bridge/verify", post(bridge::verify))
+        .route("/admin/snapshot", post(admin::snapshot))
+        .route("/admin/restore", post(admin::restore))
+        .route("/node/info", get(admin::node_info))
+        .with_state(state)
+        .layer(layers);
 
-    fn validate_with_rcp(&self) -> bool {
-        // Заглушка для проверки через rcp_engine.rs
-        self.default_symbol == "Λ0" && (self.default_freq - 7.83).abs() < 0.1
-    }
-
-    fn write_to_file(&self, signal: &BeaconSignal) {
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("beacon_emitter_out.txt")
-        {
-            let _ = writeln!(
-                file,
-                "[BEACON] {} @ {}Hz φ={:.4} [{}]",
-                signal.symbol, signal.frequency, signal.phase, signal.timestamp
-            );
-        }
-    }
-
-    fn export_to_json(&self, signal: &BeaconSignal) {
-        let json = serde_json::to_string_pretty(signal).unwrap_or_default();
-        let nonce = Nonce::try_assume_unique_for_key(&[0u8; 12]).unwrap();
-        let key = UnboundKey::new(&AES_256_GCM, &self.cipher_key).unwrap();
-        let mut aead = key.bind::<AES_256_GCM>();
-        let mut in_out = json.as_bytes().to_vec();
-        if aead.seal_in_place_append_tag(nonce, &[], &mut in_out).is_ok() {
-            if let Ok(mut file) = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open("beacon_emitter_out.json")
-            {
-                let _ = file.write_all(&in_out);
-            }
-        }
-    }
-
-    fn emit_to_lora(&self, signal: &BeaconSignal) {
-        // Заглушка для LoRa
-        self.log_event(&format!("[LORA] Emit: {} @ {}Hz φ={:.4} (not implemented)", 
-            signal.symbol, signal.frequency, signal.phase));
-    }
-
-    fn emit_to_ble(&self, signal: &BeaconSignal) {
-        // Заглушка для BLE
-        self.log_event(&format!("[BLE] Emit: {} @ {}Hz φ={:.4} (not implemented)", 
-            signal.symbol, signal.frequency, signal.phase));
-    }
-
-    fn emit_to_satellite(&self, signal: &BeaconSignal) {
-        // Заглушка для satellite
-        self.log_event(&format!("[SATELLITE] Emit: {} @ {}Hz φ={:.4} (not implemented)", 
-            signal.symbol, signal.frequency, signal.phase));
-    }
-
-    fn log_event(&self, msg: &str) {
-        let entry = format!(
-            "{{\"event\": \"beacon_emitter\", \"message\": \"{}\", \"timestamp\": {}}}\n",
-            msg,
-            Self::current_time()
-        );
-        let nonce = Nonce::try_assume_unique_for_key(&[0u8; 12]).unwrap();
-        let key = UnboundKey::new(&AES_256_GCM, &self.cipher_key).unwrap();
-        let mut aead = key.bind::<AES_256_GCM>();
-        let mut in_out = entry.as_bytes().to_vec();
-        if aead.seal_in_place_append_tag(nonce, &[], &mut in_out).is_ok() {
-            if let Ok(mut file) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.log_file)
-            {
-                let _ = file.write_all(&in_out);
-            }
-        }
-    }
-
-    pub fn current_time() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
-    }
+    let addr: SocketAddr = std::env::var("LRB_NODE_LISTEN")
+        .unwrap_or_else(|_| "0.0.0.0:8080".into())
+        .parse()?;
+    tracing::info!("logos_node listening on {} (RID={})", addr, rid);
+    axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
+    Ok(())
 }

@@ -27,13 +27,13 @@ impl Rid {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Tx {
-    pub id: String,             // blake3 of canonical form
-    pub from: Rid,              // base58(pubkey)
+    pub id: String, // blake3 of canonical form
+    pub from: Rid,  // base58(pubkey)
     pub to: Rid,
     pub amount: Amount,
     pub nonce: Nonce,
-    pub public_key: Vec<u8>,    // 32 bytes (VerifyingKey)
-    pub signature: Vec<u8>,     // 64 bytes (Signature)
+    pub public_key: Vec<u8>, // 32 bytes (VerifyingKey)
+    pub signature: Vec<u8>,  // 64 bytes (Signature)
 }
 
 impl Tx {
@@ -54,9 +54,15 @@ impl Tx {
         hex::encode(hasher.finalize().as_bytes())
     }
     pub fn validate_shape(&self) -> Result<()> {
-        if self.public_key.len() != 32 { return Err(anyhow!("bad pubkey len")); }
-        if self.signature.len() != 64 { return Err(anyhow!("bad signature len")); }
-        if self.amount == 0 { return Err(anyhow!("amount must be > 0")); }
+        if self.public_key.len() != 32 {
+            return Err(anyhow!("bad pubkey len"));
+        }
+        if self.signature.len() != 64 {
+            return Err(anyhow!("bad signature len"));
+        }
+        if self.amount == 0 {
+            return Err(anyhow!("amount must be > 0"));
+        }
         Ok(())
     }
 }
@@ -74,7 +80,10 @@ pub struct Block {
 
 impl Block {
     pub fn new(height: Height, prev_hash: String, proposer: Rid, txs: Vec<Tx>) -> Self {
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
         let mut h = Hasher::new();
         h.update(prev_hash.as_bytes());
         h.update(proposer.as_str().as_bytes());
