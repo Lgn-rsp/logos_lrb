@@ -22,3 +22,5 @@ build/
 *.sled
 snapshots/
 docs/LRB_SNAPSHOT_*.txt
+!docs/snapshots/
+!docs/snapshots/**
