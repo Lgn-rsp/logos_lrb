@@ -24,3 +24,10 @@ snapshots/
 docs/LRB_SNAPSHOT_*.txt
 !docs/snapshots/
 !docs/snapshots/**
+# temp snapshots
+docs/*.txt.tmp
+# local db and backups
+data.sled/
+data.sled.bak/
+# editor garbage
+*:* 
