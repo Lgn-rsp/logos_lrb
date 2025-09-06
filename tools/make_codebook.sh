@@ -6,9 +6,10 @@ OUT_DIR="docs"
 STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 OUT_FILE_TMP="${OUT_DIR}/LRB_FULL_LIVE_${STAMP}.txt.tmp"
 OUT_FILE="${OUT_DIR}/LRB_FULL_LIVE_${STAMP}.txt"
-SIZE_LIMIT="${SIZE_LIMIT:-2000000}"   # 2 МБ
+SIZE_LIMIT="${SIZE_LIMIT:-2000000}"   # 2 MB per file
 REPO_ROOT="/root/logos_lrb"
 
+# -------- repository globs (ASCII only) --------
 REPO_GLOBS='
 Cargo.toml
 README.md
@@ -24,6 +25,7 @@ tools
 configs
 '
 
+# -------- infra file patterns --------
 INFRA_FILES='
 /etc/nginx/nginx.conf
 /etc/nginx/conf.d/*.conf
@@ -44,6 +46,7 @@ INFRA_FILES='
 /opt/logos/www/explorer/*
 '
 
+# -------- repo excludes --------
 EXCLUDES_REPO='
 .git
 target
@@ -67,14 +70,15 @@ LOGOS_LRB_FULL_BOOK.md
 
 lang_for() {
   case "${1##*.}" in
-    rs) echo "rust";; toml) echo "toml";; json) echo "json";;
-    yml|yaml) echo "yaml";; sh|bash) echo "bash";; py) echo "python";;
-    js) echo "javascript";; ts) echo "typescript";; tsx|jsx) echo "tsx";;
-    html|htm) echo "html";; css) echo "css";; md) echo "markdown";;
-    conf|ini|service|timer|env) echo "";; *) echo "";;
+    rs) echo "rust" ;; toml) echo "toml" ;; json) echo "json" ;;
+    yml|yaml) echo "yaml" ;; sh|bash) echo "bash" ;; py) echo "python" ;;
+    js) echo "javascript" ;; ts) echo "typescript" ;; tsx|jsx) echo "tsx" ;;
+    html|htm) echo "html" ;; css) echo "css" ;; md) echo "markdown" ;;
+    conf|ini|service|timer|env) echo "" ;; *) echo "" ;;
   esac
 }
 
+# accept by extension first; fallback to grep -Iq
 looks_text() {
   case "$1" in
     *.rs|*.toml|*.json|*.yml|*.yaml|*.sh|*.bash|*.py|*.js|*.ts|*.tsx|*.jsx|*.html|*.htm|*.css|*.md|*.conf|*.ini|*.service|*.timer|*.env) return 0;;
@@ -84,9 +88,9 @@ looks_text() {
 
 should_exclude_repo() {
   f="$1"
-  # выкинуть любые пути с двоеточиями (мусор типа main.rs:30:18)
+  # drop any path containing ":" (garbage like main.rs:30:18)
   echo "$f" | grep -q ":" && return 0
-  # остальные исключения
+  # other patterns
   echo "$EXCLUDES_REPO" | while IFS= read -r pat; do
     [ -z "$pat" ] && continue
     [ "${pat#\#}" != "$pat" ] && continue
@@ -115,8 +119,7 @@ write_header() {
 dump_file() {
   f="$1"
   [ -f "$f" ] || return 0
-  # пропускаем любые пути с двоеточием (мусор)
-  echo "$f" | grep -q ":" && return 0
+  echo "$f" | grep -q ":" && return 0  # drop colon-garbage paths
 
   sz="$(wc -c <"$f" | tr -d ' ' || echo 0)"
   [ "$sz" -eq 0 ] && { printf "\n## FILE: %s  (SKIPPED, empty)\n" "$f" >>"$OUT_FILE_TMP"; return 0; }
@@ -141,11 +144,7 @@ collect_repo() {
     [ -z "$rel" ] && continue
     [ "${rel#\#}" != "$rel" ] && continue
     p="$REPO_ROOT/$rel"
-    if [ -d "$p" ]; then
-      find "$p" -type f
-    elif [ -f "$p" ]; then
-      echo "$p"
-    fi
+    if [ -d "$p" ]; then find "$p" -type f; elif [ -f "$p" ]; then echo "$p"; fi
   done
 }
 
@@ -162,19 +161,17 @@ main() {
   : >"$OUT_FILE_TMP"
   write_header
 
-  # repo
   collect_repo | sort -u | while IFS= read -r p; do
     if should_exclude_repo "$p"; then continue; fi
     dump_file "$p"
   done
 
-  # infra
   collect_infra | sort -u | while IFS= read -r p; do
     dump_file "$p"
   done
 
   mv -f "$OUT_FILE_TMP" "$OUT_FILE"
-  echo "✅ Сформировано: $OUT_FILE"
+  echo "✅ created: $OUT_FILE"
   cp -f "$OUT_FILE" "${ROOT}/LOGOS_LRB_FULL_BOOK.md" 2>/dev/null || true
 }
 
