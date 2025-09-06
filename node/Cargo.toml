@@ -31,6 +31,9 @@ dashmap = "5"
 parking_lot = "0.12"
 ipnet = "2"
 
+# JWT для админ-аутентификации (HS256)
+jsonwebtoken = "9"
+
 # ядро
 lrb_core = { path = "../lrb_core" }
 

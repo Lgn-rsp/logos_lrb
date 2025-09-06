@@ -1,9 +1,7 @@
-use axum::{http::StatusCode, response::IntoResponse};
+use axum::{response::IntoResponse, http::StatusCode};
 
 pub async fn spec() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [("Content-Type", "application/json")],
-        include_str!("openapi.json"),
-    )
+    // Компилируем JSON внутрь бинаря — стабильность и скорость
+    const SPEC: &str = include_str!("../openapi/openapi.json");
+    (StatusCode::OK, [("Content-Type", "application/json")], SPEC)
 }

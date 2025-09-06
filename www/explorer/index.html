@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta http-equiv="Cache-Control" content="no-store"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LOGOS Explorer — v2 (inline)</title>
+  <style>
+    :root{--bg:#0b0c10;--card:#11151a;--line:#1e242c;--muted:#9aa4af;--txt:#e6edf3;--btn:#1665c1;--btn-b:#3b7ddd;}
+    *{box-sizing:border-box}
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:var(--bg);color:var(--txt)}
+    header{padding:12px;background:var(--card);border-bottom:1px solid var(--line);display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    header h1{font-size:18px;margin:0}
+    #jsStat{font-size:12px;margin-left:auto}
+    main{max-width:1100px;margin:18px auto;padding:0 12px}
+    section{background:var(--card);margin:12px 0;border-radius:14px;padding:14px;border:1px solid var(--line)}
+    h3{margin:6px 0 12px 0}
+    .row{display:flex;gap:10px;flex-wrap:wrap}
+    .row>.grow{flex:1 1 360px}
+    .row>.fit{flex:0 0 140px}
+    input{width:100%;padding:10px;border-radius:10px;border:1px solid var(--line);background:#0b0f14;color:#e6edf3}
+    button{padding:10px 14px;border-radius:10px;border:1px solid var(--btn-b);background:var(--btn);color:#fff;font-weight:600;cursor:pointer}
+    .btns{display:flex;gap:8px;flex-wrap:wrap}
+    pre{white-space:pre-wrap;word-break:break-word;background:#0b0f14;border:1px solid var(--line);border-radius:10px;padding:10px;overflow:auto;margin:8px 0 0}
+    .cards{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    @media(max-width:900px){.cards{grid-template-columns:1fr}}
+    .table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;margin-top:8px}
+    table{width:100%;border-collapse:collapse;min-width:700px}
+    th,td{border-bottom:1px solid var(--line);padding:8px 10px;text-align:left;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;white-space:nowrap}
+    .muted{color:#9aa4af}
+    .pill{border:1px solid var(--line);padding:8px 10px;border-radius:10px;background:#0b0f14}
+  </style>
+</head>
+<body>
+<header>
+  <h1>LOGOS LRB — исследователь</h1>
+  <div class="pill">
+    <input id="q" placeholder="Поиск: RID, высота блока или псевдо-txid from:nonce" style="min-width:260px">
+    <button onclick="search()">Найти</button>
+  </div>
+  <div id="jsStat">js: загрузка…</div>
+</header>
+
+<main>
+
+  <section class="cards">
+    <div>
+      <h3>Голова</h3>
+      <div class="btns">
+        <button onclick="fetchHead()">GET /head</button>
+        <button onclick="toggleAuto()">Автообновление</button>
+      </div>
+      <pre id="out-head"></pre>
+    </div>
+    <div>
+      <h3>Эконом</h3>
+      <button onclick="fetchEconomy()">GET /economy</button>
+      <pre id="out-economy"></pre>
+    </div>
+  </section>
+
+  <section>
+    <h3>Блок</h3>
+    <div class="row">
+      <div class="grow"><label class="muted">высота блока</label><input id="inp-height" type="number" min="1" placeholder="например 1"></div>
+      <div class="grow btns" style="align-items:flex-end">
+        <button onclick="fetchBlock()">/block/:height</button>
+        <button onclick="fetchMix()">/block/:height/mix</button>
+        <button onclick="loadLatest()">Последние блоки</button>
+      </div>
+    </div>
+    <div class="table-wrap" id="latest-wrap" style="display:none">
+      <table><thead><tr><th>height</th><th>ts</th><th>finalized</th></tr></thead><tbody id="latest"></tbody></table>
+    </div>
+    <pre id="out-block"></pre>
+  </section>
+
+  <section>
+    <h3>Адрес (RID)</h3>
+    <div class="row">
+      <div class="grow"><label class="muted">RID (base58)</label><input id="inp-rid" placeholder="вставь RID"></div>
+      <div class="fit"><label class="muted">limit</label><input id="inp-limit" type="number" min="1" value="20"></div>
+      <div class="grow btns" style="align-items:flex-end"><button onclick="fetchHistory()">GET /history</button></div>
+    </div>
+    <div class="table-wrap">
+      <table id="tbl">
+        <thead><tr><th>nonce</th><th>from</th><th>to</th><th>amount</th><th>height</th><th>ts</th></tr></thead>
+        <tbody id="hist-body"></tbody>
+      </table>
+    </div>
+    <pre id="out-history" style="display:none"></pre>
+  </section>
+
+</main>
+
+<script>
+(function(){
+  const API = location.origin + "/api";
+  const $  = s => document.querySelector(s);
+  const setStat = (t,ok)=>{ const s=$("#jsStat"); if(!s) return; s.textContent=t; s.style.color=ok?"#0bd464":"#ff5252"; };
+  const fmtNum=n=>Number(n).toLocaleString("ru-RU");
+  const fmtTs =ms=>isFinite(ms)?new Date(Number(ms)).toLocaleString("ru-RU"):"";
+
+  async function jget(path){
+    try{ const r=await fetch(API+path,{cache:"no-store"}); if(!r.ok) return {error:r.status+" "+(await r.text()).slice(0,200)}; return await r.json(); }
+    catch(e){ return {error:String(e)}; }
+  }
+
+  // HEAD & ECON
+  let autoTimer=null;
+  window.fetchHead = async ()=>{ $("#out-head").textContent = JSON.stringify(await jget("/head"), null, 2); };
+  window.fetchEconomy = async ()=>{ $("#out-economy").textContent = JSON.stringify(await jget("/economy"), null, 2); };
+  window.toggleAuto = ()=>{
+    if(autoTimer){ clearInterval(autoTimer); autoTimer=null; setStat("js: авто выкл", true); return; }
+    const tick=async()=>{ await fetchHead(); await fetchEconomy(); };
+    tick(); autoTimer=setInterval(tick, 5000); setStat("js: авто вкл", true);
+  };
+
+  // BLOCKS
+  window.fetchBlock = async ()=>{
+    const h=Number($("#inp-height").value)||0; if(!h){ alert("Укажи высоту"); return; }
+    $("#out-block").textContent = JSON.stringify(await jget("/block/"+h), null, 2);
+    $("#latest-wrap").style.display="none";
+  };
+  window.fetchMix = async ()=>{
+    const h=Number($("#inp-height").value)||0; if(!h){ alert("Укажи высоту"); return; }
+    $("#out-block").textContent = JSON.stringify(await jget(`/block/${h}/mix`), null, 2);
+    $("#latest-wrap").style.display="none";
+  };
+  window.loadLatest = async ()=>{
+    const head=await jget("/head");
+    const H = head && head.height ? Number(head.height) : 0;
+    const tbody=$("#latest"); tbody.innerHTML="";
+    if(!H){ $("#latest-wrap").style.display="none"; return; }
+    const from=Math.max(1,H-9);  // последние 10
+    for(let h=H; h>=from; h--){
+      const b = await jget("/block/"+h);
+      const tr=document.createElement("tr");
+      tr.innerHTML = `<td>${h}</td><td>${b.ts_ms?fmtTs(b.ts_ms):""}</td><td>${b.finalized??""}</td>`;
+      tbody.appendChild(tr);
+    }
+    $("#latest-wrap").style.display="block";
+    $("#out-block").textContent = "";
+  };
+
+  // HISTORY
+  function renderRows(arr){
+    const tb=$("#hist-body"); tb.innerHTML="";
+    if(!arr || arr.length===0){ const tr=document.createElement("tr"); tr.innerHTML='<td colspan="6" class="muted">0 записей</td>'; tb.appendChild(tr); return; }
+    for(const tx of arr){
+      const tr=document.createElement("tr");
+      tr.innerHTML = `<td>${tx.nonce??""}</td><td>${tx.from??""}</td><td>${tx.to??""}</td>`+
+                     `<td>${fmtNum(tx.amount??0)}</td><td>${tx.height??""}</td><td>${fmtTs(tx.ts_ms)}</td>`;
+      tb.appendChild(tr);
+    }
+  }
+  window.fetchHistory = async ()=>{
+    const rid = ($("#inp-rid").value||"").trim(); if(!rid){ alert("Укажи RID"); return; }
+    const lim = Math.max(1, Number($("#inp-limit").value)||20);
+    const raw = await jget(`/history/${encodeURIComponent(rid)}?limit=${lim}`);
+    $("#out-history").style.display="block"; $("#out-history").textContent=JSON.stringify(raw,null,2);
+    const arr = (raw && (raw.items||raw.txs)) ? (raw.items||raw.txs) : [];
+    renderRows(arr);
+  };
+
+  // SEARCH (RID / block height / pseudo txid "from:nonce")
+  window.search = async ()=>{
+    const q = ($("#q").value||"").trim();
+    if(!q) return;
+    if(/^\d+$/.test(q)){ $("#inp-height").value=q; await fetchBlock(); return; }
+    if(/^[1-9A-HJ-NP-Za-km-z]+$/.test(q) && q.length>30){ $("#inp-rid").value=q; await fetchHistory(); return; }
+    if(q.includes(":")){ // псевдо-txid from:nonce
+      const [from,nonce] = q.split(":");
+      $("#inp-rid").value = from;
+      $("#inp-limit").value = 50;
+      await fetchHistory();
+      // подсветим найденную строку
+      [...document.querySelectorAll("#hist-body tr")].forEach(tr=>{
+        if(tr.firstChild && tr.firstChild.textContent===(nonce||"").trim()){ tr.style.background="#132235"; }
+      });
+      return;
+    }
+    alert("Не распознан формат запроса. Используй: RID, номер блока, или from:nonce");
+  };
+
+  // boot mark
+  setStat("js: готов", true);
+})();
+</script>
+</body>
+</html>

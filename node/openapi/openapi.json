@@ -1,0 +1,51 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "LOGOS LRB API", "version": "1.0.0" },
+  "paths": {
+    "/healthz": { "get": { "summary": "Liveness", "responses": { "200": { "description": "ok" } } } },
+    "/livez":   { "get": { "summary": "Live",     "responses": { "200": { "description": "ok" } } } },
+    "/readyz":  { "get": { "summary": "Ready",    "responses": { "200": { "description": "ready" } } } },
+    "/version": { "get": { "summary": "Version",  "responses": { "200": { "description": "version" } } } },
+    "/metrics": { "get": { "summary": "Prometheus metrics", "responses": { "200": { "description": "text/plain" } } } },
+    "/head":    { "get": { "summary": "Head",     "responses": { "200": { "description": "height + finalized" } } } },
+    "/economy": { "get": { "summary": "Economy snapshot", "responses": { "200": { "description": "cap/minted/burned/supply" } } } },
+    "/balance/{rid}": {
+      "get": {
+        "summary": "Balance by RID",
+        "parameters": [{ "name": "rid", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "balance/nonce" } }
+      }
+    },
+    "/history/{rid}": {
+      "get": {
+        "summary": "History by RID (paged)",
+        "parameters": [
+          { "name": "rid", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "from", "in": "query", "required": false, "schema": { "type": "integer" } },
+          { "name": "limit","in": "query", "required": false, "schema": { "type": "integer", "default": 20 } }
+        ],
+        "responses": { "200": { "description": "history page" } }
+      }
+    },
+    "/block/{height}": {
+      "get": {
+        "summary": "Block by height",
+        "parameters": [{ "name": "height", "in": "path", "required": true, "schema": { "type": "integer" } }],
+        "responses": { "200": { "description": "block record" }, "404": { "description": "not found" } }
+      }
+    },
+    "/block/{height}/mix": {
+      "get": {
+        "summary": "PhaseMix deltas for block",
+        "parameters": [{ "name": "height", "in": "path", "required": true, "schema": { "type": "integer" } }],
+        "responses": { "200": { "description": "mix deltas" }, "404": { "description": "not found or mix disabled" } }
+      }
+    },
+    "/debug_canon": { "post": { "summary": "Make canonical payload", "responses": { "200": { "description": "canon_hex" } } } },
+    "/submit_tx_batch": { "post": { "summary": "Submit batch", "responses": { "200": { "description": "results + new_height" } } } },
+    "/faucet": { "post": { "summary": "Dev faucet (LRB_ENABLE_FAUCET=1)", "responses": { "200": { "description": "granted" }, "403": { "description": "disabled" } } } },
+    "/bridge/deposit": { "post": { "summary": "rToken deposit (idempotent)", "responses": { "200": { "description": "ok/ok_repeat" }, "401": { "description": "unauthorized" } } } },
+    "/bridge/redeem":  { "post": { "summary": "rToken redeem (ticket)", "responses": { "200": { "description": "ok" }, "401": { "description": "unauthorized" } } } },
+    "/bridge/verify":  { "post": { "summary": "Verify redeem ticket", "responses": { "200": { "description": "ok:true/false" }, "401": { "description": "unauthorized" } } } }
+  }
+}
