@@ -1,102 +1,160 @@
-#!/usr/bin/env bash
-# LOGOS LRB — сборка "книги исходников" в один файл Markdown
-set -euo pipefail
+#!/usr/bin/env sh
+set -eu
 
-ROOT="$(cd "$(dirname "$0")/.."; pwd)"
-OUT="${ROOT}/LOGOS_LRB_FULL_BOOK.md"
-TS="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-GIT_SHA="$(git -C "$ROOT" rev-parse --short=7 HEAD 2>/dev/null || echo 'no-git')"
+# -------- settings --------
+OUT_DIR="docs"
+STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+OUT_FILE_TMP="${OUT_DIR}/LRB_FULL_LIVE_${STAMP}.txt.tmp"
+OUT_FILE="${OUT_DIR}/LRB_FULL_LIVE_${STAMP}.txt"
+SIZE_LIMIT="${SIZE_LIMIT:-800000}"   # байт
+REPO_ROOT="/root/logos_lrb"
 
-# Исключения (каталоги/паттерны) и лимиты
-EXCLUDES=( "LOGOS_LRB_FULL_BOOK.md" 
-  ".git" "target" "node_modules" "venv" "__pycache__" "data.sled" "var"
-  "*.log" "*.pem" "*.der" "*.crt" "*.key" "*.zip" "*.tar" "*.tar.gz" "*.7z"
-)
-MAX_SIZE=$((1024*1024))  # 1 МБ
+# Источники внутри репозитория
+REPO_GLOBS='
+lrb_core/src
+node/src
+modules
+www/wallet
+www/explorer
+infra/nginx
+infra/systemd
+scripts
+tools/bench/go
+configs
+README.md
+Cargo.toml
+'
 
-lang_for() {
-  case "${1##*.}" in
-    rs) echo "rust" ;;
-    toml) echo "toml" ;;
-    json) echo "json" ;;
-    yml|yaml) echo "yaml" ;;
-    sh|bash) echo "bash" ;;
-    py) echo "python" ;;
-    js) echo "javascript" ;;
-    ts) echo "typescript" ;;
-    tsx|jsx) echo "tsx" ;;
-    html|htm) echo "html" ;;
-    css) echo "css" ;;
-    md) echo "markdown" ;;
-    conf|ini) echo "" ;;
-    *) echo "" ;;
+# Внешние источники (инфра с сервера)
+HOST_SOURCES='
+/etc/nginx/conf.d
+/etc/nginx/sites-enabled
+/etc/systemd/system/prometheus.service
+/etc/systemd/system/alertmanager.service
+/etc/systemd/system/grafana.service
+/etc/alertmanager/alertmanager.yml
+/etc/prometheus/prometheus.yml
+/opt/logos/www/wallet
+/opt/logos/www/explorer
+'
+
+# Расширения, которые считаем текстовыми (порядок важен для языка)
+is_text_ext() {
+  case "$1" in
+    *.rs|*.toml) echo rs; return 0 ;;
+    *.go) echo go; return 0 ;;
+    *.sh) echo bash; return 0 ;;
+    *.py) echo python; return 0 ;;
+    *.ts|*.tsx|*.js) echo ts; return 0 ;;
+    *.json) echo json; return 0 ;;
+    *.yaml|*.yml) echo yaml; return 0 ;;
+    *.md) echo markdown; return 0 ;;
+    *.html) echo html; return 0 ;;
+    *.css) echo css; return 0 ;;
+    *.conf|*.service|*.timer|*.env|*.ini) echo conf; return 0 ;;
+    *) return 1 ;;
   esac
 }
 
-exclude_match() {
-  local f="$1"
-  for p in "${EXCLUDES[@]}"; do
-    case "$p" in
-      *"*") [[ "$f" == $p ]] && return 0 ;;
-      *)
-        [[ "$f" == */$p/* || "$f" == */$p || "$f" == $p ]] && return 0
-      ;;
-    esac
+# Быстрая проверка «текст/бинарь»
+is_text_file() {
+  # grep -Iq . <file> → 0 для текста
+  LC_ALL=C grep -Iq . "$1"
+}
+
+# Список файлов по маскам
+collect_paths() {
+  # 1) репозиторий
+  echo "$REPO_GLOBS" | while IFS= read -r rel; do
+    [ -z "$rel" ] && continue
+    [ "${rel#\#}" != "$rel" ] && continue
+    p="$REPO_ROOT/$rel"
+    if [ -d "$p" ]; then
+      find "$p" -type f
+    elif [ -f "$p" ]; then
+      echo "$p"
+    fi
   done
-  return 1
+  # 2) внешние
+  echo "$HOST_SOURCES" | while IFS= read -r abs; do
+    [ -z "$abs" ] && continue
+    [ "${abs#\#}" != "$abs" ] && continue
+    if [ -d "$abs" ]; then
+      find "$abs" -type f
+    elif [ -f "$abs" ]; then
+      echo "$abs"
+    fi
+  done
 }
 
 # Заголовок книги
-{
-  echo "# LOGOS LRB — Полная книга исходников"
-  echo
-  echo "_Generated: ${TS} • Commit: ${GIT_SHA}_"
-  echo
-  echo "> Содержит исходники проекта в одном файле. Исключены бинарные/секретные/кэш-файлы; каждый модуль оформлен разделом с путём и код-блоком."
-  echo
-  echo "## Оглавление"
-} > "$OUT"
-
-# Собираем оглавление (null-delimited безопасно)
-TMP_LIST="$(mktemp)"
-( cd "$ROOT" && find . -type f -print0 ) >"$TMP_LIST"
-
-# Оглавление
-while IFS= read -r -d '' f; do
-  exclude_match "$f" && continue
-  sz=$(stat -c%s "$ROOT/$f" 2>/dev/null || echo 0)
-  (( sz > MAX_SIZE )) && continue
-  anchor="$(echo "$f" | sed 's/^\.\///' | tr '/.' '--' | tr -cd '[:alnum:]-_' | tr '[:upper:]' '[:lower:]')"
-  echo "- [$f](#$anchor)" >> "$OUT"
-done < "$TMP_LIST"
-
-{
-  echo
-  echo "---"
-  echo
-} >> "$OUT"
-
-# Контент
-while IFS= read -r -d '' f; do
-  exclude_match "$f" && continue
-  sz=$(stat -c%s "$ROOT/$f" 2>/dev/null || echo 0)
-  (( sz > MAX_SIZE )) && { echo "skip (>${MAX_SIZE}): $f" >&2; continue; }
-
-  rel="${f#./}"
-  anchor="$(echo "$f" | sed 's/^\.\///' | tr '/.' '--' | tr -cd '[:alnum:]-_' | tr '[:upper:]' '[:lower:]')"
-  lang="$(lang_for "$rel")"
-
+write_header() {
   {
-    echo "## $rel"
-    echo "<a id=\"$anchor\"></a>"
+    echo "# FULL LIVE SNAPSHOT — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "# sources:"
+    echo "#  - ${REPO_ROOT}"
+    echo "#  - /opt/logos/www/wallet"
+    echo "#  - /opt/logos/www/explorer"
+    echo "#  - /etc/nginx/conf.d, /etc/nginx/sites-enabled"
+    echo "#  - /etc/systemd/system/*{prometheus,alertmanager,grafana}.service"
+    echo "#  - /etc/{prometheus,alertmanager}/*.yml"
+    echo "# size limit per file: ${SIZE_LIMIT} bytes"
     echo
-    echo '```'"$lang"
-    cat "$ROOT/$f"
-    echo
-    echo '```'
-    echo
-  } >> "$OUT"
-done < "$TMP_LIST"
+  } >>"$OUT_FILE_TMP"
+}
 
-rm -f "$TMP_LIST"
-echo "✅ Сформировано: $OUT"
+# Печать одного файла в формате:
+# ## FILE: <path>  (size=NNNb)
+# ```<lang>
+# <content>
+# ```
+dump_file() {
+  f="$1"
+  [ -f "$f" ] || return 0
+
+  sz="$(wc -c <"$f" | tr -d ' ')"
+  rel="$f"
+  lang=""
+
+  # Пропустить слишком большие
+  if [ "$sz" -gt "$SIZE_LIMIT" ]; then
+    printf "\n## FILE: %s  (SKIPPED, size=%sb > limit)\n\n" "$rel" "$sz" >>"$OUT_FILE_TMP"
+    return 0
+  fi
+
+  # Определить, текст/бинарь и язык
+  if is_text_file "$f"; then
+    if lang=$(is_text_ext "$f"); then :; else lang="txt"; fi
+    printf "\n## FILE: %s  (size=%sb)\n" "$rel" "$sz" >>"$OUT_FILE_TMP"
+    printf '```\n' >>"$OUT_FILE_TMP"     # без указания языка — GitHub рендерит стабильно
+    cat "$f" >>"$OUT_FILE_TMP"
+    printf '\n```\n' >>"$OUT_FILE_TMP"
+  else
+    printf "\n## FILE: %s  (SKIPPED, binary/non-text size=%sb)\n\n" "$rel" "$sz" >>"$OUT_FILE_TMP"
+  fi
+}
+
+main() {
+  mkdir -p "$OUT_DIR"
+  : >"$OUT_FILE_TMP"
+
+  write_header
+
+  # Сбор всех путей и сортировка
+  collect_paths | sort -u | while IFS= read -r p; do
+    # Исключения (логи, большие кеши и пр.)
+    case "$p" in
+      *.log|*.map|*.cache|*.db|*.sqlite|*.wasm) continue ;;
+      */target/*|*/node_modules/*|*/.git/*)    continue ;;
+    esac
+    dump_file "$p"
+  done
+
+  mv -f "$OUT_FILE_TMP" "$OUT_FILE"
+  echo "✅ Сформировано: $OUT_FILE"
+
+  # Дополнительно отдаём «короткий алиас» для удобства
+  cp -f "$OUT_FILE" "${REPO_ROOT}/LOGOS_LRB_FULL_BOOK.md" 2>/dev/null || true
+}
+
+main "$@"
