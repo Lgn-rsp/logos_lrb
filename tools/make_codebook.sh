@@ -1,4 +1,5 @@
 #!/usr/bin/env sh
+# LOGOS LRB — FULL LIVE book: repo + infra в один TXT (с маскировкой секретов)
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.."; pwd)"
@@ -9,13 +10,17 @@ OUT_FILE="${OUT_DIR}/LRB_FULL_LIVE_${STAMP}.txt"
 SIZE_LIMIT="${SIZE_LIMIT:-2000000}"   # 2 MB per file
 REPO_ROOT="/root/logos_lrb"
 
-# -------- repository globs (ASCII only) --------
+# --- ВКЛЮЧАЕМ ИЗ РЕПО ---
 REPO_GLOBS='
 Cargo.toml
 README.md
+src
 lrb_core/src
 node/src
 modules
+core
+wallet-proxy
+docs
 www/wallet
 www/explorer
 infra/nginx
@@ -25,7 +30,7 @@ tools
 configs
 '
 
-# -------- infra file patterns --------
+# --- ВКЛЮЧАЕМ ИНФРУ С СЕРВЕРА ---
 INFRA_FILES='
 /etc/nginx/nginx.conf
 /etc/nginx/conf.d/*.conf
@@ -46,7 +51,7 @@ INFRA_FILES='
 /opt/logos/www/explorer/*
 '
 
-# -------- repo excludes --------
+# --- ИСКЛЮЧЕНИЯ ДЛЯ РЕПО ---
 EXCLUDES_REPO='
 .git
 target
@@ -68,6 +73,7 @@ var
 LOGOS_LRB_FULL_BOOK.md
 '
 
+# язык для подсветки
 lang_for() {
   case "${1##*.}" in
     rs) echo "rust" ;; toml) echo "toml" ;; json) echo "json" ;;
@@ -78,7 +84,7 @@ lang_for() {
   esac
 }
 
-# accept by extension first; fallback to grep -Iq
+# доверяем расширению, иначе grep -Iq
 looks_text() {
   case "$1" in
     *.rs|*.toml|*.json|*.yml|*.yaml|*.sh|*.bash|*.py|*.js|*.ts|*.tsx|*.jsx|*.html|*.htm|*.css|*.md|*.conf|*.ini|*.service|*.timer|*.env) return 0;;
@@ -86,11 +92,11 @@ looks_text() {
   esac
 }
 
+# фильтр исключений репо
 should_exclude_repo() {
   f="$1"
-  # drop any path containing ":" (garbage like main.rs:30:18)
+  # с двоеточиями — мусор от редакторов
   echo "$f" | grep -q ":" && return 0
-  # other patterns
   echo "$EXCLUDES_REPO" | while IFS= read -r pat; do
     [ -z "$pat" ] && continue
     [ "${pat#\#}" != "$pat" ] && continue
@@ -98,6 +104,7 @@ should_exclude_repo() {
   done; return 1
 }
 
+# маска секретов
 mask_secrets() {
   sed -E \
     -e 's/(TELEGRAM_BOT_TOKEN=)[A-Za-z0-9:_-]+/\1***MASKED***/g' \
@@ -119,7 +126,7 @@ write_header() {
 dump_file() {
   f="$1"
   [ -f "$f" ] || return 0
-  echo "$f" | grep -q ":" && return 0  # drop colon-garbage paths
+  echo "$f" | grep -q ":" && return 0     # отсекаем мусорные имена
 
   sz="$(wc -c <"$f" | tr -d ' ' || echo 0)"
   [ "$sz" -eq 0 ] && { printf "\n## FILE: %s  (SKIPPED, empty)\n" "$f" >>"$OUT_FILE_TMP"; return 0; }
@@ -161,7 +168,7 @@ main() {
   : >"$OUT_FILE_TMP"
   write_header
 
-  collect_repo | sort -u | while IFS= read -r p; do
+  collect_repo  | sort -u | while IFS= read -r p; do
     if should_exclude_repo "$p"; then continue; fi
     dump_file "$p"
   done
