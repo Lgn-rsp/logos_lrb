@@ -1,16 +1,18 @@
 #!/usr/bin/env sh
 set -eu
 
-# -------- settings --------
+ROOT="$(cd "$(dirname "$0")/.."; pwd)"
 OUT_DIR="docs"
 STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 OUT_FILE_TMP="${OUT_DIR}/LRB_FULL_LIVE_${STAMP}.txt.tmp"
 OUT_FILE="${OUT_DIR}/LRB_FULL_LIVE_${STAMP}.txt"
-SIZE_LIMIT="${SIZE_LIMIT:-800000}"   # байт
+SIZE_LIMIT="${SIZE_LIMIT:-2000000}"   # 2 МБ на файл
 REPO_ROOT="/root/logos_lrb"
 
-# Источники внутри репозитория
+# --- что берём из репозитория (каталоги/файлы) ---
 REPO_GLOBS='
+Cargo.toml
+README.md
 lrb_core/src
 node/src
 modules
@@ -19,142 +21,164 @@ www/explorer
 infra/nginx
 infra/systemd
 scripts
-tools/bench/go
+tools
 configs
-README.md
-Cargo.toml
 '
 
-# Внешние источники (инфра с сервера)
-HOST_SOURCES='
-/etc/nginx/conf.d
-/etc/nginx/sites-enabled
-/etc/systemd/system/prometheus.service
-/etc/systemd/system/alertmanager.service
-/etc/systemd/system/grafana.service
-/etc/alertmanager/alertmanager.yml
+# --- что берём из системы (infra) ---
+INFRA_FILES='
+/etc/nginx/nginx.conf
+/etc/nginx/conf.d/*.conf
+/etc/nginx/sites-enabled/*
+/etc/systemd/system/*.service
+/etc/systemd/system/*.timer
+/etc/systemd/system/logos-node.service.d/*.conf
 /etc/prometheus/prometheus.yml
-/opt/logos/www/wallet
-/opt/logos/www/explorer
+/etc/prometheus/rules/*.yml
+/etc/alertmanager/alertmanager.yml
+/etc/alertmanager/secrets.env
+/etc/grafana/grafana.ini
+/etc/grafana/provisioning/datasources/*.yaml
+/etc/grafana/provisioning/dashboards/*.yaml
+/var/lib/grafana/dashboards/*.json
+/opt/logos/www/wallet/*
+/opt/logos/www/explorer/*
 '
 
-# Расширения, которые считаем текстовыми (порядок важен для языка)
-is_text_ext() {
-  case "$1" in
-    *.rs|*.toml) echo rs; return 0 ;;
-    *.go) echo go; return 0 ;;
-    *.sh) echo bash; return 0 ;;
-    *.py) echo python; return 0 ;;
-    *.ts|*.tsx|*.js) echo ts; return 0 ;;
-    *.json) echo json; return 0 ;;
-    *.yaml|*.yml) echo yaml; return 0 ;;
-    *.md) echo markdown; return 0 ;;
-    *.html) echo html; return 0 ;;
-    *.css) echo css; return 0 ;;
-    *.conf|*.service|*.timer|*.env|*.ini) echo conf; return 0 ;;
-    *) return 1 ;;
+# --- исключаем мусор/бинарь/секреты из репозитория ---
+EXCLUDES_REPO='
+.git
+target
+node_modules
+venv
+__pycache__
+*.pyc
+data.sled
+var
+*.log
+*.pem
+*.der
+*.crt
+*.key
+*.zip
+*.tar
+*.tar.gz
+*.7z
+LOGOS_LRB_FULL_BOOK.md
+*:*        # мусорные файлы с двоеточиями в имени
+'
+
+# язык подсветки по расширению
+lang_for() {
+  case "${1##*.}" in
+    rs) echo "rust" ;; toml) echo "toml" ;; json) echo "json" ;;
+    yml|yaml) echo "yaml" ;; sh|bash) echo "bash" ;; py) echo "python" ;;
+    js) echo "javascript" ;; ts) echo "typescript" ;; tsx|jsx) echo "tsx" ;;
+    html|htm) echo "html" ;; css) echo "css" ;; md) echo "markdown" ;;
+    conf|ini|service|timer|env) echo "" ;; *) echo "" ;;
   esac
 }
 
-# Быстрая проверка «текст/бинарь»
-is_text_file() {
-  # grep -Iq . <file> → 0 для текста
-  LC_ALL=C grep -Iq . "$1"
+# доверяем расширению; иначе grep -Iq
+looks_text() {
+  case "$1" in
+    *.rs|*.toml|*.json|*.yml|*.yaml|*.sh|*.bash|*.py|*.js|*.ts|*.tsx|*.jsx|*.html|*.htm|*.css|*.md|*.conf|*.ini|*.service|*.timer|*.env)
+      return 0 ;;
+    *) LC_ALL=C grep -Iq . "$1" ;;
+  esac
 }
 
-# Список файлов по маскам
-collect_paths() {
-  # 1) репозиторий
-  echo "$REPO_GLOBS" | while IFS= read -r rel; do
-    [ -z "$rel" ] && continue
-    [ "${rel#\#}" != "$rel" ] && continue
-    p="$REPO_ROOT/$rel"
-    if [ -d "$p" ]; then
-      find "$p" -type f
-    elif [ -f "$p" ]; then
-      echo "$p"
-    fi
-  done
-  # 2) внешние
-  echo "$HOST_SOURCES" | while IFS= read -r abs; do
-    [ -z "$abs" ] && continue
-    [ "${abs#\#}" != "$abs" ] && continue
-    if [ -d "$abs" ]; then
-      find "$abs" -type f
-    elif [ -f "$abs" ]; then
-      echo "$abs"
-    fi
-  done
+should_exclude() {
+  f="$1"
+  echo "$EXCLUDES_REPO" | while IFS= read -r pat; do
+    [ -z "$pat" ] && continue
+    [ "${pat#\#}" != "$pat" ] && continue
+    case "$pat" in
+      *"*") [ "$(printf '%s' "$f" | awk -v p="$pat" 'BEGIN{ret=1} $0 ~ p{ret=0} END{print ret}')" -eq 0 ] && exit 0 ;;
+      *) case "$f" in */$pat/*|*/$pat|$pat) exit 0 ;; esac ;;
+    esac
+  done; exit 1
 }
 
-# Заголовок книги
+mask_secrets() {
+  sed -E \
+    -e 's/(TELEGRAM_BOT_TOKEN=)[A-Za-z0-9:_-]+/\1***MASKED***/g' \
+    -e 's/(TELEGRAM_CHAT_ID=)[0-9-]+/\1***MASKED***/g' \
+    -e 's/(LRB_ADMIN_KEY=)[A-Fa-f0-9]+/\1***MASKED***/g' \
+    -e 's/(LRB_BRIDGE_KEY=)[A-Fa-f0-9]+/\1***MASKED***/g' \
+    -e 's/(LRB_ADMIN_JWT_SECRET=)[A-Za-z0-9._-]+/\1***MASKED***/g'
+}
+
 write_header() {
   {
     echo "# FULL LIVE SNAPSHOT — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "# sources:"
-    echo "#  - ${REPO_ROOT}"
-    echo "#  - /opt/logos/www/wallet"
-    echo "#  - /opt/logos/www/explorer"
-    echo "#  - /etc/nginx/conf.d, /etc/nginx/sites-enabled"
-    echo "#  - /etc/systemd/system/*{prometheus,alertmanager,grafana}.service"
-    echo "#  - /etc/{prometheus,alertmanager}/*.yml"
+    echo "# sources: $REPO_ROOT + infra (/etc, /opt)"
     echo "# size limit per file: ${SIZE_LIMIT} bytes"
     echo
   } >>"$OUT_FILE_TMP"
 }
 
-# Печать одного файла в формате:
-# ## FILE: <path>  (size=NNNb)
-# ```<lang>
-# <content>
-# ```
 dump_file() {
   f="$1"
   [ -f "$f" ] || return 0
+  sz="$(wc -c <"$f" | tr -d ' ' || echo 0)"
 
-  sz="$(wc -c <"$f" | tr -d ' ')"
-  rel="$f"
-  lang=""
+  # 0-байт и слишком большие — не тянем
+  [ "$sz" -eq 0 ] && { printf "\n## FILE: %s  (SKIPPED, empty)\n" "$f" >>"$OUT_FILE_TMP"; return 0; }
+  [ "$sz" -gt "$SIZE_LIMIT" ] && { printf "\n## FILE: %s  (SKIPPED, size=%sb > limit)\n" "$f" "$sz" >>"$OUT_FILE_TMP"; return 0; }
 
-  # Пропустить слишком большие
-  if [ "$sz" -gt "$SIZE_LIMIT" ]; then
-    printf "\n## FILE: %s  (SKIPPED, size=%sb > limit)\n\n" "$rel" "$sz" >>"$OUT_FILE_TMP"
-    return 0
-  fi
-
-  # Определить, текст/бинарь и язык
-  if is_text_file "$f"; then
-    if lang=$(is_text_ext "$f"); then :; else lang="txt"; fi
-    printf "\n## FILE: %s  (size=%sb)\n" "$rel" "$sz" >>"$OUT_FILE_TMP"
-    printf '```\n' >>"$OUT_FILE_TMP"     # без указания языка — GitHub рендерит стабильно
-    cat "$f" >>"$OUT_FILE_TMP"
+  printf "\n## FILE: %s  (size=%sb)\n" "$f" "$sz" >>"$OUT_FILE_TMP"
+  if looks_text "$f"; then
+    printf '```\n' >>"$OUT_FILE_TMP"
+    case "$f" in
+      */alertmanager/secrets.env|*/logos-node.service.d/*|*/nginx/*.conf|*/conf.d/*.conf|*/sites-enabled/*|*/prometheus*.yml|*/grafana/*.ini|*/provisioning/*|*/dashboards/*.json)
+        mask_secrets < "$f" >>"$OUT_FILE_TMP" ;;
+      *) cat "$f" >>"$OUT_FILE_TMP" ;;
+    esac
     printf '\n```\n' >>"$OUT_FILE_TMP"
   else
-    printf "\n## FILE: %s  (SKIPPED, binary/non-text size=%sb)\n\n" "$rel" "$sz" >>"$OUT_FILE_TMP"
+    printf "\n(SKIPPED, binary/non-text)\n" >>"$OUT_FILE_TMP"
   fi
+}
+
+collect_repo() {
+  echo "$REPO_GLOBS" | while IFS= read -r rel; do
+    [ -z "$rel" ] && continue
+    [ "${rel#\#}" != "$rel" ] && continue
+    p="$REPO_ROOT/$rel"
+    if [ -d "$p" ]; then find "$p" -type f; elif [ -f "$p" ]; then echo "$p"; fi
+  done
+}
+
+collect_infra() {
+  echo "$INFRA_FILES" | while IFS= read -r pat; do
+    [ -z "$pat" ] && continue
+    [ "${pat#\#}" != "$pat" ] && continue
+    for f in $pat; do [ -f "$f" ] && echo "$f"; done
+  done
 }
 
 main() {
   mkdir -p "$OUT_DIR"
   : >"$OUT_FILE_TMP"
-
   write_header
 
-  # Сбор всех путей и сортировка
-  collect_paths | sort -u | while IFS= read -r p; do
-    # Исключения (логи, большие кеши и пр.)
-    case "$p" in
-      *.log|*.map|*.cache|*.db|*.sqlite|*.wasm) continue ;;
-      */target/*|*/node_modules/*|*/.git/*)    continue ;;
-    esac
+  # repo
+  collect_repo | sort -u | while IFS= read -r p; do
+    should_exclude "$p" && continue
+    dump_file "$p"
+  done
+
+  # infra
+  collect_infra | sort -u | while IFS= read -r p; do
     dump_file "$p"
   done
 
   mv -f "$OUT_FILE_TMP" "$OUT_FILE"
   echo "✅ Сформировано: $OUT_FILE"
 
-  # Дополнительно отдаём «короткий алиас» для удобства
-  cp -f "$OUT_FILE" "${REPO_ROOT}/LOGOS_LRB_FULL_BOOK.md" 2>/dev/null || true
+  # alias в корень
+  cp -f "$OUT_FILE" "${ROOT}/LOGOS_LRB_FULL_BOOK.md" 2>/dev/null || true
 }
 
 main "$@"
