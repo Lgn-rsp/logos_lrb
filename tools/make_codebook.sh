@@ -8,7 +8,7 @@ TS="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
 GIT_SHA="$(git -C "$ROOT" rev-parse --short=7 HEAD 2>/dev/null || echo 'no-git')"
 
 # Исключения (каталоги/паттерны) и лимиты
-EXCLUDES=(
+EXCLUDES=( "LOGOS_LRB_FULL_BOOK.md" 
   ".git" "target" "node_modules" "venv" "__pycache__" "data.sled" "var"
   "*.log" "*.pem" "*.der" "*.crt" "*.key" "*.zip" "*.tar" "*.tar.gz" "*.7z"
 )
