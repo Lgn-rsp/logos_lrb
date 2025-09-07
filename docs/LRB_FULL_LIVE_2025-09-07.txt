@@ -1,0 +1,185 @@
+LOGOS LRB — Архитектура и состояние (сентябрь 2025, актуальное)
+
+📂 Репозиторий /root/logos_lrb
+
+/root/logos_lrb
+├─ Cargo.toml / README.md
+├─ lrb_core/                  # Rust-ядро L1
+│  └─ src/{ledger.rs, rcp_engine.rs, phase_integrity.rs,
+│          dynamic_balance.rs, spam_guard.rs, resonance.rs,
+│          phase_consensus.rs, phase_filters.rs, quorum.rs, types.rs,…}
+│
+├─ node/                      # Узел (Axum REST + gossip + метрики)
+│  ├─ Cargo.toml
+│  ├─ openapi/openapi.json    # OpenAPI контракт (вшитый /openapi.json)
+│  └─ src/{main.rs, api.rs, bridge.rs, admin.rs,
+│          gossip.rs, state.rs, peers.rs, fork.rs,
+│          guard.rs, metrics.rs, version.rs, auth.rs,
+│          archive/, openapi.rs,…}
+│
+├─ modules/                   # Сервисные/сетевые модули
+│  └─ uplink_*, external_phase_*, parser/tutor/env_impact, …
+│
+├─ www/
+│  ├─ index.html              # Landing page (Wallet, APK, концепция LOGOS)
+│  ├─ wallet/                 # Web Wallet (IndexedDB+WebCrypto, strict CSP + SRI)
+│  └─ explorer/               # Explorer (strict CSP + SRI, inline удалён)
+│
+├─ core/                      # аналитика/симуляции (py)
+├─ wallet-proxy/              # вспомогательные утилиты (py)
+├─ tools/                     # bench v4, k6, vegeta, SDK (TS, Go, Rust)
+├─ scripts/                   # bootstrap_node.sh, healthcheck.sh, …
+└─ configs/                   # env-шаблоны, genesis.yaml, logos_config.yaml
+
+
+---
+
+🛠️ Инфраструктура (прод-уровень)
+
+База/ключи
+/var/lib/logos/data.sled — sled-хранилище блоков и tx
+/var/lib/logos/node_key — seed ключ ноды (32 байта)
+
+systemd
+logos-node.service + drop-ins:
+  data.conf, zz-keys.conf, ratelimit.conf, runas.conf, security.conf, override.conf
+sandbox: User=logos, ProtectSystem=strict, NoNewPrivileges=yes
+
+Nginx
+редирект 80→443
+HTTPS + TLS (certbot)
+строгая CSP (без inline/eval, одной строкой) + Subresource Integrity (SRI)
+проксирование /api/, /wallet/, /explorer/, /openapi.json
+CORS: origin = свой домен
+кэширование: no-store
+
+TLS
+certbot: /etc/letsencrypt/live/45-159-248-232.sslip.io/{fullchain.pem,privkey.pem}
+
+Мониторинг
+Prometheus + NodeExporter
+Alertmanager → Telegram (node down, HeightStuck, submit latency/429)
+Grafana: дашборды (http-метрики, /submit_tx, архив, TLS/latency)
+правила Prometheus: /etc/prometheus/rules/{lrb_core.yml,lrb_submit.yml}
+алерты: up/down, 429 spike, latency p95/p99, TLS expiry
+
+
+---
+
+⚙️ Что реально работает
+
+Ядро
+• ledger (sled), mempool, spam_guard, dynamic_balance
+• Σ(t), фазовые фильтры
+• slot-продюсер
+• финализация (quorum=1)
+
+Crypto
+• AEAD XChaCha20-Poly1305 (уникальные nonce, OsRng)
+• Ed25519 подписание (WebCrypto в Wallet)
+
+REST API
+• /healthz, /head, /balance/:rid, /submit_tx
+• /bridge/{deposit,redeem,verify}
+• /economy, /history/:rid
+• /archive/history/:rid, /archive/tx/:txid  (backend: SQLite / Postgres)
+• /metrics, /version, /openapi.json
+
+Admin API (JWT/Key)
+• /admin/{set_balance,set_nonce,bump_nonce,mint,burn}
+• авторизация: X-Admin-JWT (HS256, LRB_ADMIN_JWT_SECRET), legacy X-Admin-Key
+
+Guard
+• лимитер (token-bucket)
+• ACL для /admin/*, bypass по CIDR
+• forbid_default: падение старта при CHANGE_ME/DEFAULT
+
+Bridge
+• rToken-мост (idempotent)
+• op_id по входным полям
+• deposit/redeem/verify
+
+Экономика
+• hard-cap 81M LGN
+• supply = minted − burned
+• дефляция (burn комиссий)
+
+Explorer
+• strict CSP + SRI
+• поиск по RID/блоку/from:nonce
+• история, последние блоки, автообновление
+
+Wallet (Web)
+• RID+пароль; IndexedDB (AES-GCM+PBKDF2)
+• подпись Ed25519 (WebCrypto), batch-tx
+• UI тёмная тема, strict CSP + SRI
+• расширение: экспорт/импорт, passkey (план)
+
+Сайт-визитка LOGOS (/www/index.html)
+• Кнопка Open Web Wallet
+• Кнопка «Скачать APK (Demo)»
+• Блоки: Концепция (анонимность/скорость/токеномика), Архитектура, Tokenomics (pie), Roadmap (timeline), Контакты (email/Telegram/GitHub/whitepaper)
+
+Инфра
+• systemd sandbox, nginx HTTPS+rate-limit, certbot, healthcheck.timer
+
+Мониторинг
+• Prometheus-метрики (per-route, latency histogram, RPS/errors)
+• Grafana дашборды (в т.ч. “LOGOS LRB — Submit TX”)
+• Alertmanager→Telegram (уведомления работают)
+
+Нагрузочные тесты
+• k6 и vegeta прогнаны
+• стабильно ~1000 tx/s в течение 5 минут
+• latency p95 < 2 ms, p99 < 5 ms
+• 0% ошибок (успех 100%)
+
+
+---
+
+⚠️ Выявленные баги/уязвимости
+• Dev-секреты (CHANGE_ME) → блокируются ✅
+• CSP unsafe-inline → исправлено, теперь strict CSP + SRI ✅
+• Unsafe в Rust (external_phase_link.rs) → переписан безопасно ✅
+• genesis.yaml / logos_config.yaml — пока пустые ⚠️
+
+
+---
+
+❌ Что требует доработки
+1. Кворум >1 и fork-choice
+2. Архиватор/индексация на Postgres (обкатка на проде)
+3. Unit/chaos-тесты ядра и фаз
+4. Мобильный кошелёк (Flutter)
+5. Wallet hardening: WebCrypto-only, экспорт/импорт, passkey
+6. OpenAPI/SDK автоген (Go/Rust) — интеграции
+7. Grafana: дашборды по фазам/quorum/p95/p99 latency, TLS expiry
+
+
+---
+
+📌 Итоговое описание
+LOGOS LRB — рабочий L1 (MVP++), резонансное ядро, мост, HTTPS, строгая CSP+SRI, мониторинг, Web Wallet, Explorer и сайт-визитка проекта.
+Сейчас: блоки идут, транзакции проходят, история по RID работает, архив (SQLite/PG) активен, лимитер/ACL включены, метрики и дашборды Prometheus/Grafana доступны, Telegram-оповещения работают, стресс-тесты подтверждают 1k TPS на одной ноде.
+До полного продакшена: кворум >1, архив на Postgres, тесты, мобильный кошелёк, SDK, расширенные дашборды.
+
+
+---
+
+🎯 Роадмап
+• Кворум >1 + fork-choice
+• Архиватор блоков/tx (Postgres) + API для Explorer
+• Web Wallet hardening (экспорт/импорт, passkey)
+• SDK автоген (Go/Rust) — интеграции
+• Grafana алерты (фазы, quorum, TLS expiry)
+• Unit/chaos-тесты ядра/сетевых фаз
+• Crypto-policy (forbid dev-secrets, уникальные nonce)
+• Запуск сайт-визитки LOGOS с Wallet + APK
+
+
+---
+
+🔥 Канон работы
+1. mkdir -p → cd → rm -f → nano — только боевой код, без TODO
+2. Сборка → перезапуск → тесты (curl, load, e2e)
+3. Фиксация результата (head↑, balances, metrics/alerts)
