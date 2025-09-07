@@ -1,172 +1,77 @@
-//! Guard & Rate-Limit (prod) для Axum 0.7:
-//! - Admin IP ACL (CIDR allowlist) через from_fn_with_state.
-//! - Per-IP rate-limit (token bucket) с bypass по путям и по CIDR.
-//! - PATH_BYPASS: /healthz, /livez, /readyz, /metrics, /openapi.json.
+//! Rate-limit + ACL middleware для LOGOS Node (Axum 0.7).
+//! ENV:
+//!   LRB_QPS, LRB_BURST
+//!   LRB_RATE_BYPASS_CIDRS="127.0.0.1/32,::1/128"
+//!   LRB_ADMIN_ALLOW_CIDRS="127.0.0.1/32,::1/128"
 
-use axum::response::IntoResponse;  // ← ДОБАВИТЬ ЭТУ СТРОКУ
-use axum::{
-    body::Body,
-    extract::State,
-    http::{Request, StatusCode},
-    middleware::Next,
-    response::Response,
-};
+use axum::{body::Body, http::{Request, StatusCode}, middleware::Next, response::IntoResponse};
 use dashmap::DashMap;
 use ipnet::IpNet;
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use std::{
-    net::{IpAddr, SocketAddr},
-    str::FromStr,
-    sync::Arc,
-};
-use tokio::time::Instant;
+use std::{net::{IpAddr, Ipv4Addr}, str::FromStr, time::Instant};
 
-/// Пути, которые никогда не ограничиваются лимитером.
-const PATH_BYPASS: &[&str] = &[
-    "/healthz",
-    "/livez",
-    "/readyz",
-    "/metrics",
-    "/openapi.json",
-];
+static BUCKETS: Lazy<DashMap<IpAddr, Mutex<TokenBucket>>> = Lazy::new(DashMap::new);
+static BYPASS:  Lazy<Vec<IpNet>> = Lazy::new(|| parse_cidrs(env_get("LRB_RATE_BYPASS_CIDRS").unwrap_or_else(|| "127.0.0.1/32,::1/128".into())));
+static ADMIN:   Lazy<Vec<IpNet>> = Lazy::new(|| parse_cidrs(env_get("LRB_ADMIN_ALLOW_CIDRS").unwrap_or_else(|| "127.0.0.1/32,::1/128".into())));
 
-/// ===== Admin IP ACL (используем from_fn_with_state) =====
-pub async fn admin_ip_gate(
-    State(allow): State<Arc<Vec<IpNet>>>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
-    let Some(ip) = client_ip(&req) else {
-        return StatusCode::FORBIDDEN.into_response();
-    };
-    if ip_in_allowlist(ip, &allow) {
-        next.run(req).await
-    } else {
-        StatusCode::FORBIDDEN.into_response()
+#[derive(Debug)]
+struct TokenBucket { capacity: u64, tokens: f64, qps: f64, last: Instant }
+impl TokenBucket {
+    fn new(qps: u64, burst: u64) -> Self {
+        Self { capacity: burst, tokens: burst as f64, qps: qps as f64, last: Instant::now() }
+    }
+    fn try_take(&mut self) -> bool {
+        let dt = self.last.elapsed(); self.last = Instant::now();
+        self.tokens = (self.tokens + self.qps * dt.as_secs_f64()).min(self.capacity as f64);
+        if self.tokens >= 1.0 { self.tokens -= 1.0; true } else { false }
     }
 }
 
-/// ===== Rate Limiter (token bucket per IP) =====
-pub struct RateLimiter {
-    qps: f64,
-    burst: f64,
-    /// подсети, которым разрешён обход лимитера
-    pub bypass: Arc<Vec<IpNet>>,
-    buckets: DashMap<IpAddr, Mutex<TokenBucket>>,
-}
-
-struct TokenBucket {
-    tokens: f64,
-    last: Instant,
-}
-
-impl RateLimiter {
-    pub fn new(qps: u64, burst: u64, bypass: Arc<Vec<IpNet>>) -> Self {
-        let qps = qps as f64;
-        let burst = if burst > 0 { burst as f64 } else { qps.max(1.0) * 2.0 };
-        Self {
-            qps,
-            burst,
-            bypass,
-            buckets: DashMap::new(),
-        }
-    }
-
-    /// true если IP клиента входит в bypass CIDR
-    fn is_bypass(&self, req: &Request<Body>) -> bool {
-        if let Some(ip) = client_ip(req) {
-            return ip_in_allowlist(ip, &self.bypass);
-        }
-        false
-    }
-
-    /// Проверка и списание токена. false → 429.
-    fn check(&self, req: &Request<Body>) -> bool {
-        if self.qps <= 0.0 {
-            return true;
-        }
-        let Some(ip) = client_ip(req) else { return false; };
-
-        let entry = self
-            .buckets
-            .entry(ip)
-            .or_insert_with(|| Mutex::new(TokenBucket { tokens: self.burst, last: Instant::now() }));
-        let mut tb = entry.lock();
-
-        // refill
-        let now = Instant::now();
-        let elapsed = now.saturating_duration_since(tb.last).as_secs_f64();
-        if elapsed > 0.0 {
-            tb.tokens = (tb.tokens + self.qps * elapsed).min(self.burst);
-            tb.last = now;
-        }
-
-        if tb.tokens >= 1.0 {
-            tb.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-/// Axum 0.7 middleware: rate-limit с bypass по путям и CIDR (from_fn_with_state).
-pub async fn rate_limit_ip_gate(
-    State(limiter): State<Arc<RateLimiter>>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
-    // 1) Allowlist путей
+pub async fn rate_limit_mw(req: Request<Body>, next: Next) -> axum::response::Response {
+    let ip = client_ip(&req).unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let path = req.uri().path();
-    if PATH_BYPASS.iter().any(|p| *p == path) {
+
+    // 1) Жёсткая ACL для /admin/*
+    if path.starts_with("/admin/") {
+        if !ip_in(&ip, &*ADMIN) {
+            return (StatusCode::FORBIDDEN, "admin denied").into_response();
+        }
+        // ВАЖНО: /admin/* не лимитируем (чтобы не получать 429)
         return next.run(req).await;
     }
 
-    // 2) CIDR bypass (напр., 127.0.0.1/32,::1/128)
-    if limiter.is_bypass(&req) {
-        return next.run(req).await;
-    }
-
-    // 3) Rate-limit
-    if limiter.check(&req) {
-        next.run(req).await
-    } else {
-        StatusCode::TOO_MANY_REQUESTS.into_response()
-    }
-}
-
-/// ===== Утилиты IP/ACL =====
-
-/// Разбор CSV-списка подсетей в Vec<IpNet>.
-/// Пример: "127.0.0.1/32,::1/128,10.0.0.0/8"
-pub fn parse_ip_allowlist(csv: &str) -> Vec<IpNet> {
-    csv.split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| IpNet::from_str(s).ok())
-        .collect()
-}
-
-/// Проверка, входит ли ip в allowlist.
-pub fn ip_in_allowlist(ip: IpAddr, allow: &[IpNet]) -> bool {
-    allow.iter().any(|net| net.contains(&ip))
-}
-
-/// IP клиента из X-Forwarded-For или ConnectInfo<SocketAddr>.
-fn client_ip(req: &Request<Body>) -> Option<IpAddr> {
-    // a) X-Forwarded-For: берём первый адрес
-    if let Some(h) = req.headers().get("x-forwarded-for") {
-        if let Ok(s) = h.to_str() {
-            if let Some(first) = s.split(',').next() {
-                if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                    return Some(ip);
-                }
-            }
+    // 2) Bypass для доверенных сетей
+    if !ip_in(&ip, &*BYPASS) {
+        let (qps, burst) = load_limits();
+        let entry = BUCKETS.entry(ip).or_insert_with(|| Mutex::new(TokenBucket::new(qps, burst)));
+        let mut bucket = entry.lock();
+        if !bucket.try_take() {
+            let mut resp = (StatusCode::TOO_MANY_REQUESTS, "").into_response();
+            resp.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("0.1"));
+            return resp;
         }
     }
-    // b) ConnectInfo<SocketAddr> (Axum 0.7)
-    if let Some(ci) = req.extensions().get::<axum::extract::ConnectInfo<SocketAddr>>() {
-        return Some(ci.0.ip());
+
+    next.run(req).await
+}
+
+fn env_get(k: &str) -> Option<String> { std::env::var(k).ok() }
+fn load_limits() -> (u64, u64) {
+    let qps = env_get("LRB_QPS").and_then(|s| s.parse().ok()).unwrap_or(30);
+    let burst = env_get("LRB_BURST").and_then(|s| s.parse().ok()).unwrap_or(60);
+    (qps, burst)
+}
+fn parse_cidrs(csv: String) -> Vec<IpNet> {
+    csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).filter_map(|s| IpNet::from_str(s).ok()).collect()
+}
+fn ip_in(ip: &IpAddr, nets: &[IpNet]) -> bool { nets.iter().any(|n| n.contains(ip)) }
+fn client_ip(req: &Request<Body>) -> Option<IpAddr> {
+    if let Some(xff) = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(first) = xff.split(',').next().map(|s| s.trim()) { if let Ok(ip) = first.parse() { return Some(ip); } }
+    }
+    if let Some(xri) = req.headers().get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        if let Ok(ip) = xri.parse() { return Some(ip); }
     }
     None
 }

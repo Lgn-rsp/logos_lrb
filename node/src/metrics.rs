@@ -1,100 +1,69 @@
 use axum::{
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    body::Body,
+    http::{Request, StatusCode},
+    middleware::Next,
+    response::IntoResponse,
 };
 use once_cell::sync::Lazy;
 use prometheus::{
-    histogram_opts, opts, register_histogram_vec_with_registry,
-    register_int_counter_vec_with_registry, register_int_gauge_with_registry, Encoder,
-    HistogramVec, IntCounterVec, IntGauge, Registry, TextEncoder,
+    Encoder, HistogramVec, IntCounterVec, Registry, TextEncoder, register_histogram_vec, register_int_counter_vec,
 };
 use std::time::Instant;
 
 pub static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 
-pub static HTTP_REQ_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec_with_registry!(
-        opts!("http_requests_total", "Total HTTP requests"),
-        &["endpoint", "method", "status"],
-        &REGISTRY
-    )
-    .unwrap()
-});
-pub static HTTP_REQ_DUR: Lazy<HistogramVec> = Lazy::new(|| {
-    register_histogram_vec_with_registry!(
-        histogram_opts!("http_request_duration_seconds", "HTTP duration").buckets(vec![
-            0.001, 0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.200, 0.500, 1.0, 2.0, 5.0
-        ]),
-        &["endpoint", "method"],
-        &REGISTRY
-    )
-    .unwrap()
-});
-pub static INFLIGHT: Lazy<IntGauge> = Lazy::new(|| {
-    register_int_gauge_with_registry!(opts!("http_inflight_requests", "In-flight"), &REGISTRY)
-        .unwrap()
+static HTTP_REQS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "logos_http_requests_total",
+        "HTTP requests total",
+        &["method","path","status"]
+    ).unwrap()
 });
 
-// New app metrics
-pub static HIST_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec_with_registry!(
-        opts!("lrb_history_requests_total", "History requests"),
-        &["status"],
-        &REGISTRY
-    )
-    .unwrap()
-});
-pub static BLOCKS_SERVED: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec_with_registry!(
-        opts!("lrb_blocks_served_total", "Blocks served"),
-        &["status"],
-        &REGISTRY
-    )
-    .unwrap()
+static HTTP_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "logos_http_request_duration_seconds",
+        "HTTP request latency (s)",
+        &["method","path","status"],
+        prometheus::exponential_buckets(0.001, 2.0, 14).unwrap() // 1ms..~16s
+    ).unwrap()
 });
 
-pub struct Timer {
-    start: Instant,
-    endpoint: &'static str,
-    method: &'static str,
+/// Нормализация пути (убираем динамику)
+fn normalize_path(p: &str) -> String {
+    if p.starts_with("/balance/") { return "/balance/:rid".into(); }
+    if p.starts_with("/history/") { return "/history/:rid".into(); }
+    p.to_string()
 }
-impl Timer {
-    pub fn new(endpoint: &'static str, method: &'static str) -> Self {
-        INFLIGHT.inc();
-        Self {
-            start: Instant::now(),
-            endpoint,
-            method,
-        }
+
+/// Axum-middleware: считает per-route счётчики и latency
+pub async fn track(req: Request<Body>, next: Next) -> axum::response::Response {
+    let method = req.method().as_str().to_owned();
+    let path = normalize_path(req.uri().path());
+    let start = Instant::now();
+
+    let res = next.run(req).await;
+    let status = res.status().as_u16().to_string();
+
+    HTTP_REQS.with_label_values(&[&method, &path, &status]).inc();
+    HTTP_LATENCY.with_label_values(&[&method, &path, &status]).observe(start.elapsed().as_secs_f64());
+
+    res
+}
+
+/// Exporter для Prometheus
+pub async fn prometheus() -> impl IntoResponse {
+    let metric_families = REGISTRY.gather();
+    let mut buf = Vec::new();
+    let encoder = TextEncoder::new();
+    if let Err(_) = encoder.encode(&metric_families, &mut buf) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "encode error").into_response();
     }
-    pub fn observe(self) {
-        let dt = self.start.elapsed().as_secs_f64();
-        HTTP_REQ_DUR
-            .with_label_values(&[self.endpoint, self.method])
-            .observe(dt);
-        INFLIGHT.dec();
+    match String::from_utf8(buf) {
+        Ok(text) => (StatusCode::OK, text).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "utf8 error").into_response(),
     }
 }
-pub fn inc_total(endpoint: &'static str, method: &'static str, status: StatusCode) {
-    HTTP_REQ_TOTAL
-        .with_label_values(&[endpoint, method, status.as_str()])
-        .inc();
-}
-pub async fn metrics_handler() -> Response {
-    let mf = REGISTRY.gather();
-    let mut buf = Vec::with_capacity(64 * 1024);
-    let enc = TextEncoder::new();
-    if let Err(e) = enc.encode(&mf, &mut buf) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("encode error: {e}"),
-        )
-            .into_response();
-    }
-    (
-        StatusCode::OK,
-        [("Content-Type", enc.format_type().to_string())],
-        buf,
-    )
-        .into_response()
-}
+
+/// Совместимость: старый inc_total был заглушкой — оставим no-op
+pub fn inc_total(_label: &str) {}

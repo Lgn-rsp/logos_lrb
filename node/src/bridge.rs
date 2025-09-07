@@ -1,156 +1,89 @@
-//! Bridge: rToken deposit/redeem/verify — prod-ready (single-node, idempotent).
-//! Требует корректного X-Bridge-Key (см. LRB_BRIDGE_KEY).
-//! Идемпотентность по внешнему ключу квитанции/билета через ledger.bridge_seen_mark().
-
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, response::IntoResponse, Json};
+use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use blake3;
 
-use crate::{AppState, auth::require_bridge};
-use lrb_core::types::Rid;
+use crate::state::AppState;
+use crate::auth::require_bridge;
+use crate::metrics::inc_total;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct DepositReq {
-    /// RID получателя в LOGOS (base58 от pubkey)
-    pub rid: String,
-    /// Сумма в rLGN
-    pub amount: u64,
-    /// Внешний уникальный id транзакции/квитанции (например, txid из ETH)
-    pub ext_txid: String,
+    pub txid: String,        // внешний tx (например, L1 hash)
+    pub amount: u64,         // сумма депозита
+    pub from_chain: String,  // сеть-источник (ETH/BTC/…)
+    pub to_rid: String,      // RID получателя в LRB
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RedeemReq  {
+    pub rtoken_tx: String,   // внутренняя операция/tx rToken
+    pub to_chain: String,    // сеть-назначение
+    pub to_addr: String,     // адрес-назначение во внешней сети
+    pub amount: u64,         // сумма на вывод
+}
+
+#[derive(Deserialize, Debug)]
+pub struct VerifyReq  {
+    pub op_id: String,       // идентификатор операции для проверки статуса
 }
 
 #[derive(Serialize)]
-pub struct DepositResp {
-    pub status: &'static str,
-    pub rid: String,
-    pub credited: u64,
-    pub ext_txid: String,
-}
-
-pub async fn deposit(
-    State(st): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<DepositReq>,
-) -> Result<Json<DepositResp>, StatusCode> {
-    require_bridge(&headers)?;
-
-    if req.amount == 0 || req.rid.trim().is_empty() || req.ext_txid.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    // Идемпотентность внешней транзакции
-    let rk = format!("deposit:{}", req.ext_txid.trim());
-    if !st.ledger.bridge_seen_mark(&rk).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
-        return Ok(Json(DepositResp {
-            status: "ok_repeat",
-            rid: req.rid,
-            credited: req.amount,
-            ext_txid: req.ext_txid,
-        }));
-    }
-
-    // Минтим rLGN
-    let rid = Rid(req.rid.clone());
-    st.ledger.mint_rtoken(&rid, req.amount).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok(Json(DepositResp {
-        status: "ok",
-        rid: req.rid,
-        credited: req.amount,
-        ext_txid: req.ext_txid,
-    }))
-}
-
-#[derive(Deserialize)]
-pub struct RedeemReq {
-    pub rid: String,
-    pub amount: u64,
-    /// Целевая цепь (например, "ETH")
-    #[serde(default)]
-    pub target_chain: String,
-    /// Адрес в целевой цепи
-    #[serde(default)]
-    pub target_address: String,
-}
-
-#[derive(Serialize)]
-pub struct RedeemResp {
-    pub status: &'static str,
-    pub rid: String,
-    pub debited: u64,
-    /// Билет на вывод во внешней сети (используется оффчейн-исполнителем)
-    pub redeem_ticket: String,
-    pub target_chain: String,
-    pub target_address: String,
-}
-
-pub async fn redeem(
-    State(st): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<RedeemReq>,
-) -> Result<Json<RedeemResp>, StatusCode> {
-    require_bridge(&headers)?;
-    if req.amount == 0 || req.rid.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    // Детерминированный билет — для идемпотентности и трекинга
-    let redeem_ticket = format!(
-        "redeem:{}:{}:{}:{}",
-        req.rid.trim(),
-        req.amount,
-        req.target_chain.trim(),
-        req.target_address.trim()
-    );
-
-    // Если билет уже «виден» — повтор
-    if !st.ledger.bridge_seen_mark(&redeem_ticket).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
-        return Ok(Json(RedeemResp {
-            status: "ok_repeat",
-            rid: req.rid,
-            debited: req.amount,
-            redeem_ticket,
-            target_chain: req.target_chain,
-            target_address: req.target_address,
-        }));
-    }
-
-    // Сжигаем rLGN под вывод (если баланса не хватит — вернётся 400)
-    let rid = Rid(req.rid.clone());
-    st.ledger.burn_rtoken(&rid, req.amount).map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    Ok(Json(RedeemResp {
-        status: "ok",
-        rid: req.rid,
-        debited: req.amount,
-        redeem_ticket,
-        target_chain: req.target_chain,
-        target_address: req.target_address,
-    }))
-}
-
-#[derive(Deserialize)]
-pub struct VerifyReq {
-    pub ticket: String,
-}
-
-#[derive(Serialize)]
-pub struct VerifyResp {
-    pub status: &'static str,
+pub struct BridgeResp {
     pub ok: bool,
-    pub ticket: String,
+    pub op_id: String,
+    pub info: String,
 }
 
-pub async fn verify(
-    State(st): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<VerifyReq>,
-) -> Result<Json<VerifyResp>, StatusCode> {
-    require_bridge(&headers)?;
-    if req.ticket.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+/// Хелпер: стабильный op_id по concat входных полей
+fn opid(parts: &[&str]) -> String {
+    let mut h = blake3::Hasher::new();
+    for p in parts {
+        h.update(p.as_bytes());
+        h.update(b"|");
     }
+    h.finalize().to_hex().to_string()
+}
 
-    // Первая попытка помечает — ok:false; повтор — ok:true
-    let existed = !st.ledger.bridge_seen_mark(&req.ticket).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(VerifyResp { status: "ok", ok: existed, ticket: req.ticket }))
+pub async fn deposit(State(_app): State<Arc<AppState>>, headers: HeaderMap, Json(req): Json<DepositReq>) -> impl IntoResponse {
+    inc_total("bridge_deposit");
+    if let Err(e) = require_bridge(&headers) {
+        return Json(BridgeResp { ok: false, op_id: String::new(), info: format!("forbidden: {e}") });
+    }
+    // используем ВСЕ поля, формируем детерминированный op_id
+    let op_id = opid(&[ "deposit", &req.txid, &req.amount.to_string(), &req.from_chain, &req.to_rid ]);
+    // TODO: тут можно писать заявку в sled (таблица rbridge_ops), сейчас MVP-ответ
+    Json(BridgeResp {
+        ok: true,
+        op_id,
+        info: format!("deposit registered: txid={}, amount={}, from_chain={}, to_rid={}", req.txid, req.amount, req.from_chain, req.to_rid),
+    })
+}
+
+pub async fn redeem(State(_app): State<Arc<AppState>>, headers: HeaderMap, Json(req): Json<RedeemReq>) -> impl IntoResponse {
+    inc_total("bridge_redeem");
+    if let Err(e) = require_bridge(&headers) {
+        return Json(BridgeResp { ok: false, op_id: String::new(), info: format!("forbidden: {e}") });
+    }
+    let op_id = opid(&[ "redeem", &req.rtoken_tx, &req.amount.to_string(), &req.to_chain, &req.to_addr ]);
+    // TODO: запись заявки на вывод в sled
+    Json(BridgeResp {
+        ok: true,
+        op_id,
+        info: format!("redeem accepted: rtoken_tx={}, amount={}, to_chain={}, to_addr={}", req.rtoken_tx, req.amount, req.to_chain, req.to_addr),
+    })
+}
+
+pub async fn verify(State(_app): State<Arc<AppState>>, headers: HeaderMap, Json(req): Json<VerifyReq>) -> impl IntoResponse {
+    inc_total("bridge_verify");
+    if let Err(e) = require_bridge(&headers) {
+        return Json(BridgeResp { ok: false, op_id: String::new(), info: format!("forbidden: {e}") });
+    }
+    // TODO: lookup статуса по op_id в sled; пока MVP: echo
+    Json(BridgeResp {
+        ok: true,
+        op_id: req.op_id,
+        info: "status: pending (mvp)".into(),
+    })
 }

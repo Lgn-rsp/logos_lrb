@@ -1,50 +1,48 @@
-// Безопасный AEAD: XChaCha20-Poly1305 с уникальным nonce.
-// Формат шифротекста: [24-байт nonce || ciphertext+tag]
+//! Безопасные AEAD-примитивы с уникальным nonce per message.
+//! Использование:
+//!   let (ct, nonce) = seal_aes_gcm(&key32, aad, &plain)?;
+//!   let pt = open_aes_gcm(&key32, aad, nonce, &ct)?;
 
-use anyhow::Result;
-use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
-    Key, XChaCha20Poly1305, XNonce,
-};
+use anyhow::{anyhow, Result};
+use rand::rngs::OsRng;
+use rand::RngCore;
+use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 
-pub struct AeadBox {
-    key: Key,
+/// 96-битный nonce для AES-GCM (RFC 5116). Генерируется на каждое сообщение.
+#[derive(Clone, Copy, Debug)]
+pub struct Nonce96(pub [u8; 12]);
+
+impl Nonce96 {
+    #[inline]
+    pub fn random() -> Self {
+        let mut n = [0u8; 12];
+        OsRng.fill_bytes(&mut n);
+        Self(n)
+    }
 }
 
-impl AeadBox {
-    pub fn from_key(key_bytes: &[u8; 32]) -> Self {
-        let key = Key::from_slice(key_bytes);
-        Self { key: *key }
-    }
+/// Шифрование AES-256-GCM: возвращает (ciphertext||tag, nonce)
+pub fn seal_aes_gcm(key32: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, [u8; 12])> {
+    let unbound = UnboundKey::new(&aead::AES_256_GCM, key32)
+        .map_err(|e| anyhow!("ring UnboundKey::new failed: {:?}", e))?;
+    let key = LessSafeKey::new(unbound);
+    let nonce = Nonce96::random();
 
-    pub fn seal(&self, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
-        let cipher = XChaCha20Poly1305::new(&self.key);
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng); // 24 байта
-        let mut out = Vec::with_capacity(24 + plaintext.len() + 16);
-        out.extend_from_slice(&nonce);
-        let ct = cipher
-            .encrypt(
-                &nonce,
-                chacha20poly1305::aead::Payload {
-                    msg: plaintext,
-                    aad,
-                },
-            )
-            .expect("AEAD encrypt failed");
-        out.extend_from_slice(&ct);
-        out
-    }
+    let mut inout = plaintext.to_vec();
+    key.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce.0), Aad::from(aad), &mut inout)
+        .map_err(|_| anyhow!("AEAD seal failed"))?;
+    Ok((inout, nonce.0))
+}
 
-    pub fn open(&self, aad: &[u8], data: &[u8]) -> Result<Vec<u8>> {
-        if data.len() < 24 + 16 {
-            anyhow::bail!("AEAD: buffer too short");
-        }
-        let (nonce_bytes, ct) = data.split_at(24);
-        let cipher = XChaCha20Poly1305::new(&self.key);
-        let nonce = XNonce::from_slice(nonce_bytes);
-        let pt = cipher
-            .decrypt(nonce, chacha20poly1305::aead::Payload { msg: ct, aad })
-            .map_err(|_| anyhow::anyhow!("AEAD decrypt failed"))?;
-        Ok(pt)
-    }
+/// Расшифрование AES-256-GCM: принимает nonce и (ciphertext||tag)
+pub fn open_aes_gcm(key32: &[u8; 32], aad: &[u8], nonce: [u8; 12], ciphertext_and_tag: &[u8]) -> Result<Vec<u8>> {
+    let unbound = UnboundKey::new(&aead::AES_256_GCM, key32)
+        .map_err(|e| anyhow!("ring UnboundKey::new failed: {:?}", e))?;
+    let key = LessSafeKey::new(unbound);
+
+    let mut buf = ciphertext_and_tag.to_vec();
+    let plain = key
+        .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::from(aad), &mut buf)
+        .map_err(|_| anyhow!("AEAD open failed"))?;
+    Ok(plain.to_vec())
 }

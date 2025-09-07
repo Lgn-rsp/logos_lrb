@@ -1,21 +1,21 @@
-use axum::Json;
+use axum::{response::IntoResponse, Json};
 use serde::Serialize;
 
+include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
+
 #[derive(Serialize)]
-pub struct VersionInfo {
-    pub name: &'static str,
-    pub version: &'static str,
-    pub git_commit: &'static str,
-    pub build_time_utc: &'static str,
-    pub rustc: &'static str,
+struct Version {
+    version: &'static str,
+    git_hash: &'static str,
+    git_branch: &'static str,
+    built_at: &'static str,
 }
 
-pub async fn version() -> Json<VersionInfo> {
-    Json(VersionInfo {
-        name: "logos_node",
-        version: env!("CARGO_PKG_VERSION"),
-        git_commit: env!("GIT_COMMIT"),
-        build_time_utc: env!("BUILD_TIME_UTC"),
-        rustc: env!("RUSTC_VER"),
+pub async fn get() -> impl IntoResponse {
+    Json(Version {
+        version: BUILD_PKG_VERSION,
+        git_hash: BUILD_GIT_HASH,
+        git_branch: BUILD_GIT_BRANCH,
+        built_at: BUILD_TIMESTAMP_RFC3339,
     })
 }

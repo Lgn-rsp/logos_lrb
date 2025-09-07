@@ -1,7 +1,14 @@
-use axum::{response::IntoResponse, http::StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::http::{HeaderValue, StatusCode};
 
-pub async fn spec() -> impl IntoResponse {
-    // Компилируем JSON внутрь бинаря — стабильность и скорость
-    const SPEC: &str = include_str!("../openapi/openapi.json");
-    (StatusCode::OK, [("Content-Type", "application/json")], SPEC)
+static SPEC: &str = include_str!("../openapi/openapi.json");
+
+pub async fn serve() -> Response {
+    let mut resp = (StatusCode::OK, SPEC).into_response();
+    let headers = resp.headers_mut();
+    let _ = headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    resp
 }
