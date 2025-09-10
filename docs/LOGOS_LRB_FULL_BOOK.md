@@ -9708,3 +9708,8 @@ curl -s http://127.0.0.1:8080/economy | jq
 curl -s "http://127.0.0.1:8080/archive/blocks?limit=3" | jq
 curl -s "http://127.0.0.1:8080/archive/txs?limit=3"    | jq
 ```
+
+---
+
+# Конец книги
+
