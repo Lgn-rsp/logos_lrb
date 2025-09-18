@@ -27,17 +27,27 @@ impl Archive {
         Ok(())
     }
 
-    pub async fn record_txs_batch(&self, rows:&[(&str,u64,&str,&str,u64,u64,Option<u64>)]) -> Result<()> {
+    /// Batch-ingest (owned строки → без проблем с лайфтаймами)
+    pub async fn record_txs_batch(
+        &self,
+        rows:&[(String,u64,String,String,u64,u64,Option<u64>)]
+    ) -> Result<()> {
+        use std::time::Duration;
         let client = self.pool.get().await?;
-        // backpressure: ограничим размер батча и выставим «глубину»
         let depth = rows.len() as i64;
         metrics::set_archive_queue(depth);
+
+        let stmt = "insert into txs (txid,height,from_rid,to_rid,amount,nonce,ts) \
+                    values ($1,$2,$3,$4,$5,$6,to_timestamp($7)) on conflict do nothing";
+
         for chunk in rows.chunks(500) {
-            let stmt = "insert into txs (txid,height,from_rid,to_rid,amount,nonce,ts) values ($1,$2,$3,$4,$5,$6,to_timestamp($7)) on conflict do nothing";
             for r in chunk {
-                client.execute(stmt, &[&r.0,&(r.1 as i64),&r.2,&r.3,&(r.4 as i64),&(r.5 as i64),&(r.6.unwrap_or(0) as i64)]).await?;
+                client.execute(
+                    stmt,
+                    &[&r.0, &(r.1 as i64), &r.2, &r.3, &(r.4 as i64), &(r.5 as i64), &(r.6.unwrap_or(0) as i64)]
+                ).await?;
             }
-            if chunk.len()==500 { tokio::time::sleep(std::time::Duration::from_millis(2)).await; }
+            if chunk.len()==500 { tokio::time::sleep(Duration::from_millis(2)).await; }
         }
         metrics::set_archive_queue(0);
         Ok(())
@@ -92,7 +102,7 @@ impl Archive {
         Ok(rows.into_iter().map(TxRecord::from_row).collect())
     }
 
-    // ← ДОБАВЛЕНО: нужен для /archive_block (и может использоваться API)
+    // нужен для /archive_block (и может использоваться API)
     pub async fn block_by_height(&self, h:i64) -> Result<Option<BlockRow>> {
         let client = self.pool.get().await?;
         let row = client.query_opt(

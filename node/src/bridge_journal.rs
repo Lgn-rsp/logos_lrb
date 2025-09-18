@@ -9,7 +9,7 @@ use std::time::{SystemTime,UNIX_EPOCH};
 pub enum OpKind { Deposit, Redeem }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum OpStatus { Pending, Confirmed, Redeemed, Failed }
+pub enum OpStatus { Pending, PayoutSent, Confirmed, Redeemed, Failed }
 
 #[derive(Serialize,Deserialize,Clone)]
 pub struct JournalOp{
@@ -30,9 +30,9 @@ fn now_ms()->u64{
 }
 
 pub struct Journal{
-    ops: sled::Tree,      // j:<op_id> -> JournalOp
-    idx: sled::Tree,      // x:<ext_txid> -> op_id (idempotency)
-    retry: sled::Tree,    // r:<op_id> -> next_retry_ms
+    ops:   sled::Tree,      // j:<op_id> -> JournalOp
+    idx:   sled::Tree,      // x:<ext_txid> -> op_id (idempotency)
+    retry: sled::Tree,      // r:<op_id> -> next_retry_ms
 }
 
 impl Journal{
@@ -48,12 +48,10 @@ impl Journal{
     fn de<T:for<'a> Deserialize<'a>>(v:&IVec)->T{ serde_json::from_slice(v).unwrap() }
 
     pub fn begin(&self, kind:OpKind, rid:&str, amount:u64, ext:&str)->Result<JournalOp>{
-        // idempotency: if ext exists => return existing
         if let Some(opid) = self.idx.get(format!("x:{ext}"))?{
             let id = std::str::from_utf8(&opid).unwrap();
             return self.get_by_id(id);
         }
-        // детерминированный id на основе параметров и времени
         let op_id = blake3::hash(
             format!("{kind:?}:{rid}:{amount}:{ext}:{:?}", now_ms()).as_bytes()
         ).to_hex().to_string();
@@ -85,7 +83,6 @@ impl Journal{
 
     pub fn schedule_retry(&self, op_id:&str, delay_ms:u64)->Result<()>{
         let when = now_ms()+delay_ms;
-        // sled ждет Into<IVec>; используем Vec<u8>, чтобы удовлетворить трейт
         self.retry.insert(format!("r:{op_id}"), when.to_be_bytes().to_vec())?;
         Ok(())
     }
@@ -132,10 +129,11 @@ impl Journal{
             let (_k,v)=kv?;
             let op:JournalOp = Self::de(&v);
             match op.status{
-                OpStatus::Pending   => pending   += 1,
-                OpStatus::Confirmed => confirmed += 1,
-                OpStatus::Redeemed  => redeemed  += 1,
-                OpStatus::Failed    => {}
+                OpStatus::Pending      => pending   += 1,
+                OpStatus::PayoutSent   => pending   += 1, // считаем как pending
+                OpStatus::Confirmed    => confirmed += 1,
+                OpStatus::Redeemed     => redeemed  += 1,
+                OpStatus::Failed       => {}
             }
         }
         Ok((pending, confirmed, redeemed))
