@@ -1,0 +1,192 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "LOGOS LRB API", "version": "0.1.0" },
+  "paths": {
+    "/healthz": { "get": { "summary": "health", "responses": { "200": { "description": "OK" } } } },
+    "/version": { "get": { "summary": "build info", "responses": { "200": { "description": "OK" } } } },
+
+    "/head": {
+      "get": {
+        "summary": "current head heights",
+        "responses": {
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Head" } } } }
+        }
+      }
+    },
+
+    "/metrics": { "get": { "summary": "prometheus metrics", "responses": { "200": { "description": "OK" } } } },
+
+    "/submit_tx": {
+      "post": {
+        "summary": "submit transaction (Ed25519 verified)",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TxIn" } } }
+        },
+        "responses": {
+          "200": { "description": "accepted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SubmitResult" } } } },
+          "401": { "description": "bad signature" },
+          "409": { "description": "nonce reuse" }
+        }
+      }
+    },
+
+    "/submit_tx_batch": {
+      "post": {
+        "summary": "submit batch of transactions (Ed25519 verified)",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SubmitBatchReq" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "per-item results",
+            "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/SubmitBatchItem" } } } }
+          }
+        }
+      }
+    },
+
+    "/archive/blocks": {
+      "get": {
+        "summary": "recent blocks",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer" } },
+          { "name": "before_height", "in": "query", "schema": { "type": "integer" } }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+
+    "/archive/txs": {
+      "get": {
+        "summary": "recent txs",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer" } },
+          { "name": "rid", "in": "query", "schema": { "type": "string" } },
+          { "name": "before_ts", "in": "query", "schema": { "type": "integer" } }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+
+    "/archive/history/{rid}": {
+      "get": {
+        "summary": "history by rid",
+        "parameters": [
+          { "name": "rid", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+
+    "/archive/tx/{txid}": {
+      "get": {
+        "summary": "tx by id",
+        "parameters": [
+          { "name": "txid", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "OK" },
+          "404": { "description": "not found" }
+        }
+      }
+    },
+
+    "/stake/delegate": {
+      "post": {
+        "summary": "delegate (compat wrapper)",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StakeAction" } } } },
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/stake/undelegate": {
+      "post": {
+        "summary": "undelegate (compat wrapper)",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StakeAction" } } } },
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/stake/claim": {
+      "post": {
+        "summary": "claim rewards (compat wrapper)",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StakeAction" } } } },
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/stake/my/{rid}": {
+      "get": {
+        "summary": "my delegations + rewards (compat wrapper)",
+        "parameters": [
+          { "name": "rid", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      }
+    }
+  },
+
+  "components": {
+    "schemas": {
+      "Head": {
+        "type": "object",
+        "required": ["height","finalized"],
+        "properties": {
+          "height":   { "type": "integer", "format": "uint64" },
+          "finalized":{ "type": "integer", "format": "uint64" }
+        }
+      },
+
+      "TxIn": {
+        "type": "object",
+        "required": ["from","to","amount","nonce","sig_hex"],
+        "properties": {
+          "from":   { "type": "string", "description": "base58(pubkey)" },
+          "to":     { "type": "string" },
+          "amount": { "type": "integer", "format": "uint64" },
+          "nonce":  { "type": "integer", "format": "uint64" },
+          "sig_hex":{ "type": "string" },
+          "memo":   { "type": "string", "nullable": true }
+        }
+      },
+
+      "SubmitResult": {
+        "type": "object",
+        "required": ["ok","info"],
+        "properties": {
+          "ok":   { "type": "boolean" },
+          "txid": { "type": "string", "nullable": true },
+          "info": { "type": "string" }
+        }
+      },
+
+      "SubmitBatchReq": {
+        "type": "object",
+        "required": ["txs"],
+        "properties": {
+          "txs": { "type": "array", "items": { "$ref": "#/components/schemas/TxIn" } }
+        }
+      },
+
+      "SubmitBatchItem": {
+        "type": "object",
+        "required": ["ok","info","index"],
+        "properties": {
+          "ok":   { "type": "boolean" },
+          "txid": { "type": "string", "nullable": true },
+          "info": { "type": "string" },
+          "index":{ "type": "integer" }
+        }
+      },
+
+      "StakeAction": {
+        "type": "object",
+        "required": ["rid"],
+        "properties": {
+          "rid":       { "type": "string" },
+          "validator": { "type": "string" },
+          "amount":    { "type": "integer", "format": "uint64", "nullable": true }
+        }
+      }
+    }
+  }
+}
