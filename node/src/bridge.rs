@@ -1,12 +1,12 @@
-//! rToken bridge: durable journal + idempotency + retry worker + external payout (async & Send-safe)
+//! rToken bridge: durable journal + idempotency + retry worker + external payout (Send-safe)
 
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{warn,error};
 
 use crate::{state::AppState, metrics};
-use crate::bridge_journal::{Journal,OpKind,OpStatus,JournalOp};
+use crate::bridge_journal::{Journal, OpKind, OpStatus, JournalOp};
 use crate::payout_adapter::PayoutAdapter;
 
 #[derive(Deserialize)]
@@ -17,16 +17,26 @@ pub struct RedeemReq  { pub rid:String, pub amount:u64, pub ext_txid:String }
 #[inline]
 fn journal(st:&AppState)->Journal { Journal::open(st.sled()).expect("journal") }
 
-/* -------------------- DEPOSIT (idempotent) -------------------- */
+/* -------------------- DEPOSIT (strict idempotent) -------------------- */
 pub async fn deposit(State(st):State<Arc<AppState>>, Json(req):Json<DepositReq>) -> (StatusCode,String){
     let j = journal(&st);
+
+    // begin() создаёт новую опку или возвращает существующую по ext_txid
     let op = match j.begin(OpKind::Deposit, &req.rid, req.amount, &req.ext_txid){
-        Ok(op) => op,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{{\"error\":\"journal_begin:{e}\"}}")),
+        Ok(op)=>op, Err(e)=>return (StatusCode::INTERNAL_SERVER_ERROR, format!("{{\"error\":\"journal_begin:{e}\"}}")),
     };
     metrics::inc_bridge("deposit","begin");
 
-    // credit in ledger (без await, guard не пересекает await)
+    // Idempotency по статусу: повтор «OK» если уже проведено
+    match op.status {
+        OpStatus::Confirmed | OpStatus::Redeemed => {
+            metrics::inc_bridge("deposit","idempotent_ok");
+            return (StatusCode::OK, format!("{{\"ok\":true,\"op_id\":\"{}\"}}", op.op_id));
+        }
+        _ => {}
+    }
+
+    // Кредитуем ТОЛЬКО когда статус Pending/Failed (guard не пересекает await)
     {
         let l = st.ledger.lock();
         let bal  = l.get_balance(&req.rid).unwrap_or(0);
@@ -38,23 +48,28 @@ pub async fn deposit(State(st):State<Arc<AppState>>, Json(req):Json<DepositReq>)
             metrics::inc_bridge("deposit","failed");
             return (StatusCode::ACCEPTED, "{\"status\":\"queued\"}".into());
         }
-    } // <- guard дропнулся здесь
+    }
 
     let _ = j.set_status(&op.op_id, OpStatus::Confirmed, None);
     metrics::inc_bridge("deposit","confirmed");
     (StatusCode::OK, format!("{{\"ok\":true,\"op_id\":\"{}\"}}", op.op_id))
 }
 
-/* -------------------- REDEEM (idempotent, Send-safe) -------------------- */
+/* -------------------- REDEEM (idempotent on ext_txid, payout async) -------------------- */
 pub async fn redeem(State(st):State<Arc<AppState>>, Json(req):Json<RedeemReq>) -> (StatusCode,String){
     let j = journal(&st);
     let op = match j.begin(OpKind::Redeem, &req.rid, req.amount, &req.ext_txid){
-        Ok(op) => op,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{{\"error\":\"journal_begin:{e}\"}}")),
+        Ok(op)=>op, Err(e)=>return (StatusCode::INTERNAL_SERVER_ERROR, format!("{{\"error\":\"journal_begin:{e}\"}}")),
     };
     metrics::inc_bridge("redeem","begin");
 
-    // debit locally (burn) в отдельном скоупе — никаких await внутри!
+    // если уже Redeemed — повтор «OK»
+    if matches!(op.status, OpStatus::Redeemed) {
+        metrics::inc_bridge("redeem","idempotent_ok");
+        return (StatusCode::OK, format!("{{\"ok\":true,\"op_id\":\"{}\"}}", op.op_id));
+    }
+
+    // burn локально (без await внутри)
     {
         let l = st.ledger.lock();
         let bal = l.get_balance(&req.rid).unwrap_or(0);
@@ -70,9 +85,9 @@ pub async fn redeem(State(st):State<Arc<AppState>>, Json(req):Json<RedeemReq>) -
             metrics::inc_bridge("redeem","failed");
             return (StatusCode::ACCEPTED, "{\"status\":\"queued\"}".into());
         }
-    } // <- guard дропнулся, теперь можно await
+    }
 
-    // external payout (async)
+    // внешний payout
     match PayoutAdapter::from_env() {
         Ok(adapter) => {
             if let Err(e) = adapter.send_payout(&req.rid, req.amount, &req.ext_txid).await {
@@ -97,9 +112,8 @@ pub async fn redeem(State(st):State<Arc<AppState>>, Json(req):Json<RedeemReq>) -
     (StatusCode::OK, format!("{{\"ok\":true,\"op_id\":\"{}\"}}", op.op_id))
 }
 
-/* -------------------- RETRY worker (idempotent & Send-safe) -------------------- */
+/* -------------------- Retry worker -------------------- */
 async fn retry_deposit(st:&AppState, j:&Journal, op:&JournalOp){
-    // всё без await внутри скоупа
     {
         let l = st.ledger.lock();
         let bal  = l.get_balance(&op.rid).unwrap_or(0);
@@ -116,32 +130,20 @@ async fn retry_deposit(st:&AppState, j:&Journal, op:&JournalOp){
 
 async fn retry_redeem(j:&Journal, op:&JournalOp){
     match PayoutAdapter::from_env() {
-        Ok(adapter) => {
-            match adapter.send_payout(&op.rid, op.amount, &op.ext_txid).await {
-                Ok(()) => {
-                    let _ = j.set_status(&op.op_id, OpStatus::Redeemed, None);
-                    metrics::inc_bridge("redeem","redeemed");
-                    let _ = j.clear_retry(&op.op_id);
-                }
-                Err(e) => {
-                    warn!("retry payout error: {e}");
-                    let _ = j.schedule_retry(&op.op_id, 90_000);
-                }
-            }
-        }
-        Err(e) => {
-            warn!("retry payout adapter init: {e}");
-            let _ = j.schedule_retry(&op.op_id, 90_000);
-        }
+        Ok(adapter) => match adapter.send_payout(&op.rid, op.amount, &op.ext_txid).await {
+            Ok(()) => { let _=j.set_status(&op.op_id, OpStatus::Redeemed, None); metrics::inc_bridge("redeem","redeemed"); let _=j.clear_retry(&op.op_id); }
+            Err(e) => { warn!("retry payout error: {e}"); let _=j.schedule_retry(&op.op_id, 90_000); }
+        },
+        Err(e) => { warn!("retry payout adapter init: {e}"); let _=j.schedule_retry(&op.op_id, 90_000); }
     }
 }
 
 pub async fn retry_worker(st:Arc<AppState>){
     let j = journal(&st);
     loop {
-        if let Ok(list) = j.due_retries(100) {
+        if let Ok(list) = j.due_retries(100){
             for op_id in list {
-                if let Ok(op) = j.get_by_id(&op_id) {
+                if let Ok(op) = j.get_by_id(&op_id){
                     match op.kind {
                         OpKind::Deposit => retry_deposit(&st, &j, &op).await,
                         OpKind::Redeem  => retry_redeem(&j, &op).await,
@@ -153,13 +155,11 @@ pub async fn retry_worker(st:Arc<AppState>){
     }
 }
 
-/* -------------------- Health (journal stats) -------------------- */
+/* -------------------- Health -------------------- */
 pub async fn health(State(st):State<Arc<AppState>>)->(StatusCode,String){
     let j = journal(&st);
     match j.stats(){
-        Ok((pending,confirmed,redeemed)) =>
-            (StatusCode::OK, format!("{{\"pending\":{pending},\"confirmed\":{confirmed},\"redeemed\":{redeemed}}}")),
-        Err(e) =>
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("{{\"error\":\"{e}\"}}")),
+        Ok((p,c,r)) => (StatusCode::OK, format!("{{\"pending\":{p},\"confirmed\":{c},\"redeemed\":{r}}}")),
+        Err(e)      => (StatusCode::INTERNAL_SERVER_ERROR, format!("{{\"error\":\"{e}\"}}")),
     }
 }

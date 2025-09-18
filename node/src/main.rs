@@ -8,7 +8,7 @@ use tracing::{info, warn};
 mod api;
 mod bridge;
 mod bridge_journal;
-mod payout_adapter;   // модуль адаптера выплат
+mod payout_adapter;   // адаптер выплат (используется в bridge)
 mod admin;
 mod gossip;
 mod state;
@@ -21,6 +21,8 @@ mod archive;
 mod openapi;
 mod auth;
 mod stake;
+mod stake_claim;      // ← реальный claim_settle (зачисление в ledger)
+mod health;           // ← /livez + /readyz
 mod wallet;
 mod producer;
 
@@ -28,12 +30,14 @@ fn router(app_state: Arc<state::AppState>) -> Router {
     Router::new()
         // --- public ---
         .route("/healthz", get(api::healthz))
+        .route("/livez",  get(health::livez))       // liveness
+        .route("/readyz", get(health::readyz))      // readiness
         .route("/head",    get(api::head))
         .route("/balance/:rid", get(api::balance))
-        .route("/submit_tx",      post(api::submit_tx))
-        .route("/submit_tx_batch",post(api::submit_tx_batch))
-        .route("/economy",        get(api::economy))
-        .route("/history/:rid",   get(api::history))
+        .route("/submit_tx",       post(api::submit_tx))
+        .route("/submit_tx_batch", post(api::submit_tx_batch))
+        .route("/economy",         get(api::economy))
+        .route("/history/:rid",    get(api::history))
 
         // --- archive API (PG) ---
         .route("/archive/blocks",      get(api::archive_blocks))
@@ -46,9 +50,11 @@ fn router(app_state: Arc<state::AppState>) -> Router {
         .route("/stake/undelegate", post(api::stake_undelegate))
         .route("/stake/claim",      post(api::stake_claim))
         .route("/stake/my/:rid",    get(api::stake_my))
+        // реальный settle награды в ledger
+        .route("/stake/claim_settle", post(stake_claim::claim_settle))
 
-        // --- bridge (durable + payout) ---
-        // ВАЖНО: явные замыкания с точными типами экстракторов — иначе Axum не выведет Handler.
+        // --- bridge (durable + payout, Send-safe) ---
+        // Явные async-замыкания с точными типами экстракторов, чтобы удовлетворить Handler и Send
         .route(
             "/bridge/deposit",
             post(|st: axum::extract::State<Arc<state::AppState>>,
@@ -77,7 +83,7 @@ fn router(app_state: Arc<state::AppState>) -> Router {
         .route("/admin/mint",        post(admin::mint))
         .route("/admin/burn",        post(admin::burn))
 
-        // --- legacy routes (если используются) ---
+        // --- legacy (если используются) ---
         .merge(wallet::routes())
         .merge(stake::routes())
 
