@@ -6,18 +6,36 @@ Wants=network-online.target
 [Service]
 User=logos
 Group=logos
-WorkingDirectory=/opt/logos
-ExecStart=/opt/logos/logos_node
 EnvironmentFile=/etc/logos/node-%i.env
+WorkingDirectory=/opt/logos
+ExecStart=/opt/logos/bin/logos_node
+Restart=always
+RestartSec=1s
+StartLimitIntervalSec=0
+LimitNOFILE=1048576
 
 # sandbox
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=full
-ProtectHome=yes
-ReadWritePaths=/var/lib/logos-%i
-Restart=on-failure
-RestartSec=3
+AmbientCapabilities=
+CapabilityBoundingSet=
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=/var/lib/logos /etc/logos
+ProtectSystem=strict
+
+# лог (journalctl -u logos-node@<inst>)
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
