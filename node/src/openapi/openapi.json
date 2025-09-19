@@ -2,8 +2,23 @@
   "openapi": "3.0.3",
   "info": { "title": "LOGOS LRB API", "version": "0.1.0" },
   "paths": {
-    "/healthz": { "get": { "summary": "health", "responses": { "200": { "description": "OK" } } } },
+    "/healthz": {
+      "get": { "summary": "health", "responses": { "200": { "description": "OK" } } }
+    },
+    "/livez": {
+      "get": { "summary": "liveness", "responses": { "200": { "description": "alive" } } }
+    },
+    "/readyz": {
+      "get": {
+        "summary": "readiness",
+        "responses": {
+          "200": { "description": "ready" },
+          "503": { "description": "not ready" }
+        }
+      }
+    },
     "/version": { "get": { "summary": "build info", "responses": { "200": { "description": "OK" } } } },
+    "/metrics": { "get": { "summary": "prometheus metrics", "responses": { "200": { "description": "OK" } } } },
 
     "/head": {
       "get": {
@@ -14,15 +29,10 @@
       }
     },
 
-    "/metrics": { "get": { "summary": "prometheus metrics", "responses": { "200": { "description": "OK" } } } },
-
     "/submit_tx": {
       "post": {
         "summary": "submit transaction (Ed25519 verified)",
-        "requestBody": {
-          "required": true,
-          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TxIn" } } }
-        },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TxIn" } } } },
         "responses": {
           "200": { "description": "accepted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SubmitResult" } } } },
           "401": { "description": "bad signature" },
@@ -34,15 +44,9 @@
     "/submit_tx_batch": {
       "post": {
         "summary": "submit batch of transactions (Ed25519 verified)",
-        "requestBody": {
-          "required": true,
-          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SubmitBatchReq" } } }
-        },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SubmitBatchReq" } } } },
         "responses": {
-          "200": {
-            "description": "per-item results",
-            "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/SubmitBatchItem" } } } }
-          }
+          "200": { "description": "per-item results", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/SubmitBatchItem" } } } } }
         }
       }
     },
@@ -57,7 +61,6 @@
         "responses": { "200": { "description": "OK" } }
       }
     },
-
     "/archive/txs": {
       "get": {
         "summary": "recent txs",
@@ -69,27 +72,18 @@
         "responses": { "200": { "description": "OK" } }
       }
     },
-
     "/archive/history/{rid}": {
       "get": {
         "summary": "history by rid",
-        "parameters": [
-          { "name": "rid", "in": "path", "required": true, "schema": { "type": "string" } }
-        ],
+        "parameters": [ { "name": "rid", "in": "path", "required": true, "schema": { "type": "string" } } ],
         "responses": { "200": { "description": "OK" } }
       }
     },
-
     "/archive/tx/{txid}": {
       "get": {
         "summary": "tx by id",
-        "parameters": [
-          { "name": "txid", "in": "path", "required": true, "schema": { "type": "string" } }
-        ],
-        "responses": {
-          "200": { "description": "OK" },
-          "404": { "description": "not found" }
-        }
+        "parameters": [ { "name": "txid", "in": "path", "required": true, "schema": { "type": "string" } } ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "not found" } }
       }
     },
 
@@ -117,10 +111,30 @@
     "/stake/my/{rid}": {
       "get": {
         "summary": "my delegations + rewards (compat wrapper)",
-        "parameters": [
-          { "name": "rid", "in": "path", "required": true, "schema": { "type": "string" } }
-        ],
+        "parameters": [ { "name": "rid", "in": "path", "required": true, "schema": { "type": "string" } } ],
         "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/stake/claim_settle": {
+      "post": {
+        "summary": "settle reward into ledger",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ClaimSettle" } } } },
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+
+    "/bridge/deposit_json": {
+      "post": {
+        "summary": "bridge deposit (mTLS + HMAC)",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BridgeDeposit" } } } },
+        "responses": { "200": { "description": "idempotent OK" }, "202": { "description": "queued/retry" }, "401": { "description": "unauthorized (key/HMAC/nonce)" } }
+      }
+    },
+    "/bridge/redeem_json": {
+      "post": {
+        "summary": "bridge redeem (mTLS + HMAC)",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BridgeRedeem" } } } },
+        "responses": { "200": { "description": "ok" }, "202": { "description": "queued/retry" }, "401": { "description": "unauthorized (key/HMAC/nonce)" } }
       }
     }
   },
@@ -135,20 +149,27 @@
           "finalized":{ "type": "integer", "format": "uint64" }
         }
       },
-
+      "Balance": {
+        "type": "object",
+        "required": ["rid","balance","nonce"],
+        "properties": {
+          "rid":     { "type": "string" },
+          "balance": { "type": "integer", "format": "uint128" },
+          "nonce":   { "type": "integer", "format": "uint64" }
+        }
+      },
       "TxIn": {
         "type": "object",
         "required": ["from","to","amount","nonce","sig_hex"],
         "properties": {
-          "from":   { "type": "string", "description": "base58(pubkey)" },
-          "to":     { "type": "string" },
-          "amount": { "type": "integer", "format": "uint64" },
-          "nonce":  { "type": "integer", "format": "uint64" },
-          "sig_hex":{ "type": "string" },
-          "memo":   { "type": "string", "nullable": true }
+          "from":    { "type": "string", "description": "base58(pubkey)" },
+          "to":      { "type": "string" },
+          "amount":  { "type": "integer", "format": "uint64" },
+          "nonce":   { "type": "integer", "format": "uint64" },
+          "sig_hex": { "type": "string" },
+          "memo":    { "type": "string", "nullable": true }
         }
       },
-
       "SubmitResult": {
         "type": "object",
         "required": ["ok","info"],
@@ -158,7 +179,6 @@
           "info": { "type": "string" }
         }
       },
-
       "SubmitBatchReq": {
         "type": "object",
         "required": ["txs"],
@@ -166,18 +186,16 @@
           "txs": { "type": "array", "items": { "$ref": "#/components/schemas/TxIn" } }
         }
       },
-
       "SubmitBatchItem": {
         "type": "object",
         "required": ["ok","info","index"],
         "properties": {
-          "ok":   { "type": "boolean" },
-          "txid": { "type": "string", "nullable": true },
-          "info": { "type": "string" },
-          "index":{ "type": "integer" }
+          "ok":    { "type": "boolean" },
+          "txid":  { "type": "string", "nullable": true },
+          "info":  { "type": "string" },
+          "index": { "type": "integer" }
         }
       },
-
       "StakeAction": {
         "type": "object",
         "required": ["rid"],
@@ -185,6 +203,32 @@
           "rid":       { "type": "string" },
           "validator": { "type": "string" },
           "amount":    { "type": "integer", "format": "uint64", "nullable": true }
+        }
+      },
+      "ClaimSettle": {
+        "type": "object",
+        "required": ["rid","amount"],
+        "properties": {
+          "rid":    { "type": "string" },
+          "amount": { "type": "integer", "format": "uint64" }
+        }
+      },
+      "BridgeDeposit": {
+        "type": "object",
+        "required": ["rid","amount","ext_txid"],
+        "properties": {
+          "rid":      { "type": "string" },
+          "amount":   { "type": "integer", "format": "uint64" },
+          "ext_txid": { "type": "string" }
+        }
+      },
+      "BridgeRedeem": {
+        "type": "object",
+        "required": ["rid","amount","ext_txid"],
+        "properties": {
+          "rid":      { "type": "string" },
+          "amount":   { "type": "integer", "format": "uint64" },
+          "ext_txid": { "type": "string" }
         }
       }
     }

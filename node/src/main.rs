@@ -21,8 +21,8 @@ mod archive;
 mod openapi;
 mod auth;
 mod stake;
-mod stake_claim;      // ← реальный claim_settle (зачисление в ledger)
-mod health;           // ← /livez + /readyz
+mod stake_claim;      // реальный claim_settle (зачисление в ledger)
+mod health;           // /livez + /readyz
 mod wallet;
 mod producer;
 
@@ -54,7 +54,10 @@ fn router(app_state: Arc<state::AppState>) -> Router {
         .route("/stake/claim_settle", post(stake_claim::claim_settle))
 
         // --- bridge (durable + payout, Send-safe) ---
-        // Явные async-замыкания с точными типами экстракторов, чтобы удовлетворить Handler и Send
+        // JSON endpoints для mTLS+HMAC периметра (Nginx rewrites → сюда)
+        .route("/bridge/deposit_json", post(bridge::deposit_json))
+        .route("/bridge/redeem_json",  post(bridge::redeem_json))
+        // Оставляем и «обычные» (внутренние) эндпоинты через безопасные замыкания
         .route(
             "/bridge/deposit",
             post(|st: axum::extract::State<Arc<state::AppState>>,
