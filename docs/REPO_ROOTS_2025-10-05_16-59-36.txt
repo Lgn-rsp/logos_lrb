@@ -1,0 +1,13 @@
+git,rust	.
+configs	configs
+configs	configs/env
+infra	infra/nginx
+infra,infra,infra,infra,infra,infra,infra,infra,infra,infra,infra,infra,infra,infra,infra	infra/systemd
+rust	lrb_core
+rust	node
+go	tools/go_test
+go	tools/load
+python	wallet-proxy
+www	www
+www	www/explorer
+www	www/wallet
