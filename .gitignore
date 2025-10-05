@@ -31,3 +31,5 @@ data.sled/
 data.sled.bak/
 # editor garbage
 *:* 
+docs/LOGOS_LRB_BOOK/*.md
+docs/snapshots/*
