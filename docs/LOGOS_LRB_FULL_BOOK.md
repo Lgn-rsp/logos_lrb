@@ -40060,3 +40060,4356 @@ curl -s "http://127.0.0.1:8080/archive/txs?limit=3"    | jq
 
 # Конец книги
 
+
+
+---
+
+# 2. Версии и окружение
+
+
+
+=== rustc --version ===
+
+```text
+rustc 1.89.0 (29483883e 2025-08-04)
+
+```
+
+
+=== cargo --version ===
+
+```text
+cargo 1.89.0 (c24e10642 2025-06-23)
+
+```
+
+
+=== nginx -v ===
+
+```text
+nginx version: nginx/1.24.0 (Ubuntu)
+
+```
+
+
+=== psql --version ===
+
+```text
+psql (PostgreSQL) 16.10 (Ubuntu 16.10-0ubuntu0.24.04.1)
+
+```
+
+
+=== systemd env ===
+
+```text
+Environment=RUST_LOG=info
+LRB_DATA_PATH=/var/lib/logos/data.sled
+LRB_NODE_LISTEN=127.0.0.1:8080
+LRB_ARCHIVE_URL=postgres://logos:StrongPass123@127.0.0.1:5432/logos
+LRB_WALLET_ORIGIN=https://45-159-248-232.sslip.io
+LRB_SLOT_MS=200
+LRB_JWT_SECRET=CHANGE_ME
+LRB_BRIDGE_KEY=CHANGE_ME
+
+```
+
+
+---
+
+# 3. Cargo workspace
+
+
+
+=== /root/logos_lrb/Cargo.toml ===
+
+```toml
+[workspace]
+members = ["lrb_core","node"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.78"
+
+[workspace.dependencies]
+# web/async
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+tokio = { version = "1.40", features = ["full"] }
+
+# core utils
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+anyhow = "1.0"
+bytes = "1.6"
+time = { version = "0.3", features = ["macros"] }
+
+# logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# crypto / hash / codecs
+ring = "0.17"
+rand = "0.8"
+ed25519-dalek = { version = "2.2", default-features = false, features = ["rand_core","std"] }
+sha2 = "0.10"
+blake3 = "1.5"
+hex = "0.4"
+base64 = "0.22"
+bs58 = "0.5"
+uuid = { version = "1.8", features = ["v4"] }
+bincode = "1.3"
+jsonwebtoken = "9"
+
+# storage / http
+sled = "0.34"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls","http2","json"] }
+
+```
+
+
+---
+
+# 4. lrb_core (исходники + Cargo)
+
+
+
+=== /root/logos_lrb/lrb_core/Cargo.toml ===
+
+```toml
+[package]
+name = "lrb_core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+
+# крипто/кодеки/идентификаторы
+ring = { workspace = true }
+rand = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+bs58 = { workspace = true }
+uuid = { workspace = true }
+bincode = { workspace = true }
+
+# хранилище/сеть/асинхрон
+sled = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+
+```
+
+
+=== /root/logos_lrb/lrb_core/src/anti_replay.rs ===
+
+```rust
+use std::collections::HashMap;
+
+/// Простейшее TTL-окно: tag -> last_seen_ms
+#[derive(Clone, Debug)]
+pub struct AntiReplayWindow {
+    ttl_ms: u128,
+    map: HashMap<String, u128>,
+}
+
+impl AntiReplayWindow {
+    pub fn new(ttl_ms: u128) -> Self {
+        Self {
+            ttl_ms,
+            map: HashMap::new(),
+        }
+    }
+
+    /// true, если новый (вставлен), false — если повтор/просрочен
+    pub fn check_and_insert(&mut self, tag: String, now_ms: u128) -> bool {
+        // Чистка "по ходу"
+        self.gc(now_ms);
+        if let Some(&seen) = self.map.get(&tag) {
+            if now_ms.saturating_sub(seen) <= self.ttl_ms {
+                return false; // повтор
+            }
+        }
+        self.map.insert(tag, now_ms);
+        true
+    }
+
+    pub fn gc(&mut self, now_ms: u128) {
+        let ttl = self.ttl_ms;
+        self.map.retain(|_, &mut t| now_ms.saturating_sub(t) <= ttl);
+    }
+}
+
+```
+
+
+=== /root/logos_lrb/lrb_core/src/beacon.rs ===
+
+```rust
+use crate::types::Rid;
+use anyhow::{anyhow, Result};
+use reqwest::Client;
+use serde::Serialize;
+use std::time::Duration;
+use tokio::time::interval;
+
+#[derive(Serialize)]
+struct BeatPayload<'a> {
+    rid: &'a str,
+    ts_ms: u128,
+}
+
+pub async fn run_beacon(rid: Rid, peers: Vec<String>, period: Duration) -> Result<()> {
+    if peers.is_empty() {
+        // Нечего слать — просто спим, чтобы не грузить CPU
+        let mut t = interval(period);
+        loop {
+            t.tick().await;
+        }
+    }
+    let client = Client::new();
+    let mut t = interval(period);
+    loop {
+        t.tick().await;
+        let payload = BeatPayload {
+            rid: rid.as_str(),
+            ts_ms: crate::heartbeat::now_ms(),
+        };
+        let body = serde_json::to_vec(&payload)?;
+        for p in &peers {
+            // POST {peer}/beat
+            let url = format!("{}/beat", p.trim_end_matches('/'));
+            let req = client
+                .post(&url)
+                .header("content-type", "application/json")
+                .body(body.clone())
+                .build()?;
+            if let Err(e) = client.execute(req).await {
+                // Не падаем — идём к следующему
+                let _ = e;
+            }
+        }
+    }
+}
+
+/// Парсинг переменной окружения вида: "http://ip1:8080,http://ip2:8080"
+pub fn parse_peers(env_val: &str) -> Result<Vec<String>> {
+    let peers: Vec<String> = env_val
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if peers
+        .iter()
+        .any(|p| !(p.starts_with("http://") || p.starts_with("https://")))
+    {
+        return Err(anyhow!("peer must start with http(s)://"));
+    }
+    Ok(peers)
+}
+
+```
+
+
+=== /root/logos_lrb/lrb_core/src/crypto.rs ===
+
+```rust
+//! Безопасные AEAD-примитивы с уникальным nonce per message.
+//! Использование:
+//!   let (ct, nonce) = seal_aes_gcm(&key32, aad, &plain)?;
+//!   let pt = open_aes_gcm(&key32, aad, nonce, &ct)?;
+
+use anyhow::{anyhow, Result};
+use rand::rngs::OsRng;
+use rand::RngCore;
+use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
+
+/// 96-битный nonce для AES-GCM (RFC 5116). Генерируется на каждое сообщение.
+#[derive(Clone, Copy, Debug)]
+pub struct Nonce96(pub [u8; 12]);
+
+impl Nonce96 {
+    #[inline]
+    pub fn random() -> Self {
+        let mut n = [0u8; 12];
+        OsRng.fill_bytes(&mut n);
+        Self(n)
+    }
+}
+
+/// Шифрование AES-256-GCM: возвращает (ciphertext||tag, nonce)
+pub fn seal_aes_gcm(key32: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, [u8; 12])> {
+    let unbound = UnboundKey::new(&aead::AES_256_GCM, key32)
+        .map_err(|e| anyhow!("ring UnboundKey::new failed: {:?}", e))?;
+    let key = LessSafeKey::new(unbound);
+    let nonce = Nonce96::random();
+
+    let mut inout = plaintext.to_vec();
+    key.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce.0), Aad::from(aad), &mut inout)
+        .map_err(|_| anyhow!("AEAD seal failed"))?;
+    Ok((inout, nonce.0))
+}
+
+/// Расшифрование AES-256-GCM: принимает nonce и (ciphertext||tag)
+pub fn open_aes_gcm(key32: &[u8; 32], aad: &[u8], nonce: [u8; 12], ciphertext_and_tag: &[u8]) -> Result<Vec<u8>> {
+    let unbound = UnboundKey::new(&aead::AES_256_GCM, key32)
+        .map_err(|e| anyhow!("ring UnboundKey::new failed: {:?}", e))?;
+    let key = LessSafeKey::new(unbound);
+
+    let mut buf = ciphertext_and_tag.to_vec();
+    let plain = key
+        .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::from(aad), &mut buf)
+        .map_err(|_| anyhow!("AEAD open failed"))?;
+    Ok(plain.to_vec())
+}
+
+```
+
+
+=== /root/logos_lrb/lrb_core/src/dynamic_balance.rs ===
+
+```rust
+// Простейшая адаптация LGN_cost: основана на длине мемпула.
+#[derive(Clone, Debug)]
+pub struct DynamicBalance {
+    base_cost_microunits: u64, // 1e-6 LGN
+    slope_per_tx: u64,         // увеличение за каждую tx в мемпуле
+}
+
+impl DynamicBalance {
+    pub fn new(base: u64, slope: u64) -> Self {
+        Self {
+            base_cost_microunits: base,
+            slope_per_tx: slope,
+        }
+    }
+    pub fn lgn_cost(&self, mempool_len: usize) -> u64 {
+        self.base_cost_microunits + (self.slope_per_tx * mempool_len as u64)
+    }
+}
+
+```
+
+
+=== /root/logos_lrb/lrb_core/src/heartbeat.rs ===
+
+```rust
+use crate::types::Rid;
+use anyhow::Result;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::time::interval;
+
+#[derive(Clone, Debug)]
+pub struct HeartbeatState {
+    pub last_seen_ms: u128,
+}
+
+#[derive(Clone)]
+pub struct Heartbeat {
+    inner: Arc<Mutex<HashMap<Rid, HeartbeatState>>>,
+    quarantined: Arc<Mutex<HashSet<Rid>>>,
+    quarantine_after_ms: u128,
+    check_every_ms: u64,
+}
+
+impl Heartbeat {
+    pub fn new(quarantine_after: Duration, check_every: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            quarantined: Arc::new(Mutex::new(HashSet::new())),
+            quarantine_after_ms: quarantine_after.as_millis(),
+            check_every_ms: check_every.as_millis() as u64,
+        }
+    }
+
+    pub fn register_beat(&self, rid: Rid, now_ms: u128) {
+        let mut map = self.inner.lock().unwrap();
+        map.insert(
+            rid,
+            HeartbeatState {
+                last_seen_ms: now_ms,
+            },
+        );
+    }
+
+    pub fn is_quarantined(&self, rid: &Rid) -> bool {
+        self.quarantined.lock().unwrap().contains(rid)
+    }
+
+    pub fn peers_snapshot(&self) -> Vec<(Rid, u128)> {
+        let map = self.inner.lock().unwrap();
+        map.iter()
+            .map(|(r, s)| (r.clone(), s.last_seen_ms))
+            .collect()
+    }
+
+    pub async fn run_monitor(self) -> Result<()> {
+        let mut tick = interval(Duration::from_millis(self.check_every_ms));
+        loop {
+            tick.tick().await;
+            let now_ms = now_ms();
+            let mut q = self.quarantined.lock().unwrap();
+            let map = self.inner.lock().unwrap();
+            for (rid, st) in map.iter() {
+                let silent = now_ms.saturating_sub(st.last_seen_ms);
+                if silent > self.quarantine_after_ms {
+                    q.insert(rid.clone());
+                } else {
+                    q.remove(rid);
+                }
+            }
+        }
+    }
+}
+
+pub fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+}
+
+```
+
+
+=== /root/logos_lrb/lrb_core/src/ledger.rs ===
+
+```rust
+// (весь файл целиком — актуальная версия с прошлой правки + set_nonce)
+use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
+use sled::{Db, IVec, Tree};
+use std::path::Path;
+
+const META_HEIGHT: &[u8] = b"height";
+const META_SUPPLY_MINTED: &[u8] = b"supply_minted";
+const META_SUPPLY_BURNED: &[u8] = b"supply_burned";
+const META_LAST_HASH: &[u8] = b"last_block_hash";
+
+#[derive(Clone)]
+pub struct Ledger {
+    db: Db,
+    t_meta: Tree,
+    t_bal: Tree,
+    t_nonce: Tree,
+    t_tx: Tree,
+    t_txidx: Tree,
+    t_acctx: Tree,
+    t_bmeta: Tree,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredTx {
+    pub txid: String, pub height: u64, pub from: String, pub to: String,
+    pub amount: u64, pub nonce: u64, pub memo: Option<String>, pub ts: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxRec {
+    pub txid: String, pub height: u64, pub from: String, pub to: String,
+    pub amount: u64, pub nonce: u64, pub ts: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockMeta { pub height: u64, pub block_hash: String }
+
+impl Ledger {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let db = sled::open(path)?;
+        let t_meta  = db.open_tree("meta")?;
+        let t_bal   = db.open_tree("bal")?;
+        let t_nonce = db.open_tree("nonce")?;
+        let t_tx    = db.open_tree("tx")?;
+        let t_txidx = db.open_tree("txidx")?;
+        let t_acctx = db.open_tree("acctx")?;
+        let t_bmeta = db.open_tree("bmeta")?;
+        if t_meta.get(META_HEIGHT)?.is_none()         { let z=0u64.to_be_bytes(); t_meta.insert(META_HEIGHT,&z)?; }
+        if t_meta.get(META_SUPPLY_MINTED)?.is_none()  { let z=0u64.to_be_bytes(); t_meta.insert(META_SUPPLY_MINTED,&z)?; }
+        if t_meta.get(META_SUPPLY_BURNED)?.is_none()  { let z=0u64.to_be_bytes(); t_meta.insert(META_SUPPLY_BURNED,&z)?; }
+        if t_meta.get(META_LAST_HASH)?.is_none()      { t_meta.insert(META_LAST_HASH, b"")?; }
+        Ok(Self{ db,t_meta,t_bal,t_nonce,t_tx,t_txidx,t_acctx,t_bmeta })
+    }
+
+    #[inline] fn be_u64(v:u64)->[u8;8]{ v.to_be_bytes() }
+    #[inline] fn be_u128(v:u128)->[u8;16]{ v.to_be_bytes() }
+    #[inline] fn from_be_u64(iv:&IVec)->u64{ let mut b=[0u8;8]; b.copy_from_slice(iv.as_ref()); u64::from_be_bytes(b) }
+    #[inline] fn from_be_u128(iv:&IVec)->u128{ let mut b=[0u8;16]; b.copy_from_slice(iv.as_ref()); u128::from_be_bytes(b) }
+
+    // meta/head
+    pub fn height(&self)->Result<u64>{ Ok(Self::from_be_u64(&self.t_meta.get(META_HEIGHT)?.ok_or_else(||anyhow!("no height"))?)) }
+    fn set_height(&self,h:u64)->Result<()> { let be=Self::be_u64(h); self.t_meta.insert(META_HEIGHT,&be)?; Ok(()) }
+    fn last_block_hash(&self)->Result<String>{ Ok(self.t_meta.get(META_LAST_HASH)?.map(|v|String::from_utf8_lossy(v.as_ref()).to_string()).unwrap_or_default()) }
+    fn set_last_block_hash(&self,s:&str)->Result<()> { self.t_meta.insert(META_LAST_HASH,s.as_bytes())?; Ok(()) }
+    pub fn head(&self)->Result<(u64,String)>{ Ok((self.height().unwrap_or(0), self.last_block_hash().unwrap_or_default())) }
+
+    // supply
+    pub fn supply(&self)->Result<(u64,u64)>{
+        let m=self.t_meta.get(META_SUPPLY_MINTED)?.map(|v|Self::from_be_u64(&v)).unwrap_or(0);
+        let b=self.t_meta.get(META_SUPPLY_BURNED)?.map(|v|Self::from_be_u64(&v)).unwrap_or(0);
+        Ok((m,b))
+    }
+    pub fn add_minted(&self,v:u64)->Result<u64>{ let (m,b)=self.supply()?; let nm=m.saturating_add(v); let be=Self::be_u64(nm); self.t_meta.insert(META_SUPPLY_MINTED,&be)?; Ok(nm-b) }
+    pub fn add_burned(&self,v:u64)->Result<u64>{ let (m,b)=self.supply()?; let nb=b.saturating_add(v); let be=Self::be_u64(nb); self.t_meta.insert(META_SUPPLY_BURNED,&be)?; Ok(m-nb) }
+
+    // balances / nonce
+    pub fn get_balance(&self,rid:&str)->Result<u128>{ Ok(self.t_bal.get(rid.as_bytes())?.map(|v|Self::from_be_u128(&v)).unwrap_or(0)) }
+    pub fn set_balance(&self,rid:&str,amount:u128)->Result<()> { let be=Self::be_u128(amount); self.t_bal.insert(rid.as_bytes(),&be)?; Ok(()) }
+    pub fn get_nonce(&self,rid:&str)->Result<u64>{ Ok(self.t_nonce.get(rid.as_bytes())?.map(|v|Self::from_be_u64(&v)).unwrap_or(0)) }
+    pub fn bump_nonce(&self,rid:&str)->Result<u64>{ let n=self.get_nonce(rid)?; let nn=n.saturating_add(1); let be=Self::be_u64(nn); self.t_nonce.insert(rid.as_bytes(),&be)?; Ok(nn) }
+    pub fn set_nonce(&self,rid:&str,value:u64)->Result<()> { let be=Self::be_u64(value); self.t_nonce.insert(rid.as_bytes(),&be)?; Ok(()) }
+
+    // history
+    pub fn get_tx_height(&self,txid:&str)->Result<Option<u64>>{ Ok(self.t_txidx.get(txid.as_bytes())?.map(|v|Self::from_be_u64(&v))) }
+    pub fn account_txs_page(&self,rid:&str,page:u32,per_page:u32)->Result<Vec<TxRec>>{
+        let per=per_page.clamp(1,1000);
+        let mut start=Vec::with_capacity(rid.len()+1+8);
+        start.extend_from_slice(rid.as_bytes()); start.push(b'|');
+        let h=self.height().unwrap_or(0);
+        let start_h=h.saturating_sub(page as u64 * per as u64);
+        start.extend_from_slice(&start_h.to_be_bytes());
+        let mut out=Vec::with_capacity(per as usize);
+        for item in self.t_acctx.range(start..){ let (_k,v)=item?; let rec:TxRec=bincode::deserialize(v.as_ref())?; out.push(rec); if out.len()>=per as usize{break;} }
+        Ok(out)
+    }
+
+    // submit_tx SIMPLE
+    pub fn submit_tx_simple(&self, from:&str,to:&str,amount:u64,nonce:u64,memo:Option<String>)->Result<StoredTx>{
+        let fb=self.get_balance(from)?; if fb < amount as u128 { return Err(anyhow!("insufficient funds")); }
+        let n=self.get_nonce(from)?; if nonce != n.saturating_add(1) { return Err(anyhow!("bad nonce")); }
+        self.set_balance(from, fb - amount as u128)?; let tb=self.get_balance(to)?; self.set_balance(to, tb.saturating_add(amount as u128))?;
+        self.bump_nonce(from)?;
+        let h=self.height().unwrap_or(0).saturating_add(1); self.set_height(h)?;
+        use sha2::{Digest,Sha256};
+        let mut hasher=Sha256::new(); hasher.update(from.as_bytes()); hasher.update(to.as_bytes());
+        hasher.update(&amount.to_be_bytes()); hasher.update(&nonce.to_be_bytes()); hasher.update(&h.to_be_bytes());
+        let txid=hex::encode(hasher.finalize());
+        let mut h2=Sha256::new(); h2.update(&h.to_be_bytes()); h2.update(txid.as_bytes()); let block_hash=hex::encode(h2.finalize());
+        self.set_last_block_hash(&block_hash)?;
+        let stx=StoredTx{txid:txid.clone(),height:h,from:from.into(),to:to.into(),amount,nonce,memo,ts:Some(Self::unix_ts())};
+        self.t_tx.insert(txid.as_bytes(), serde_json::to_vec(&stx)?)?;
+        let bhe=Self::be_u64(h); self.t_txidx.insert(txid.as_bytes(), &bhe)?;
+        let rec=TxRec{txid:stx.txid.clone(),height:stx.height,from:stx.from.clone(),to:stx.to.clone(),amount:stx.amount,nonce:stx.nonce,ts:stx.ts};
+        let mut kf=Vec::with_capacity(from.len()+1+8); kf.extend_from_slice(from.as_bytes()); kf.push(b'|'); kf.extend_from_slice(&h.to_be_bytes());
+        self.t_acctx.insert(kf, bincode::serialize(&rec)?)?;
+        let mut kt=Vec::with_capacity(to.len()+1+8); kt.extend_from_slice(to.as_bytes()); kt.push(b'|'); kt.extend_from_slice(&h.to_be_bytes());
+        self.t_acctx.insert(kt, bincode::serialize(&rec)?)?;
+        let meta=BlockMeta{height:h,block_hash:block_hash.clone()};
+        self.t_bmeta.insert(h.to_be_bytes(), bincode::serialize(&meta)?)?;
+        Ok(stx)
+    }
+
+    // совместимость rcp_engine
+    pub fn get_block_by_height(&self,h:u64)->Result<BlockMeta>{
+        match self.t_bmeta.get(h.to_be_bytes())?{ Some(v)=>Ok(bincode::deserialize::<BlockMeta>(v.as_ref())?), None=>Ok(BlockMeta{height:h,block_hash:String::new()}) }
+    }
+    pub fn commit_block_atomic<T>(&self,_b:&T)->Result<()> { Ok(()) }
+    pub fn index_block<T>(&self,h:u64,hash:&str,_ts:u128,_txs:&T)->Result<()>{
+        self.set_last_block_hash(hash)?; let meta=BlockMeta{height:h,block_hash:hash.to_string()};
+        self.t_bmeta.insert(h.to_be_bytes(), bincode::serialize(&meta)?)?; Ok(())
+    }
+    pub fn set_finalized(&self,_h:u64)->Result<()> { Ok(()) }
+
+    #[inline] fn unix_ts()->u64{ use std::time::{SystemTime,UNIX_EPOCH}; SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
+}
+
+```
+
+
+=== /root/logos_lrb/lrb_core/src/lib.rs ===
+
+```rust
+/*!
+ * LOGOS LRB — core crate
+ * Экспорт модулей ядра L1: типы, консенсус, мемпул/баланс, резонанс, сигналы, защита.
+ * Здесь только декларация модулей — реализация в соответствующих *.rs файлах.
+ */
+
+pub mod types;
+
+pub mod anti_replay;
+pub mod beacon;
+pub mod heartbeat;
+
+pub mod dynamic_balance;
+pub mod spam_guard;
+
+pub mod phase_consensus;
+pub mod phase_filters;
+pub mod phase_integrity;
+pub mod quorum;
+pub mod sigpool;
+
+pub mod ledger;
+pub mod rcp_engine;
+pub mod resonance;
+
+// Безопасный AEAD (XChaCha20-Poly1305) — общий хелпер для модулей
+pub mod crypto;
+
+```
+
+
+=== /root/logos_lrb/lrb_core/src/phase_consensus.rs ===
+
+```rust
+use std::collections::{HashMap, HashSet};
+
+/// Фазовый консенсус Σ(t) с учётом блока (height, block_hash).
+/// Накапливает голоса RID'ов по конкретному хешу блока.
+/// Финализованный height повышается, когда кворум собран по **одному** хешу на этом height.
+pub struct PhaseConsensus {
+    /// votes[height][block_hash] = {rid_b58, ...}
+    votes: HashMap<u64, HashMap<String, HashSet<String>>>,
+    finalized_h: u64,
+    quorum_n: usize,
+}
+
+impl PhaseConsensus {
+    pub fn new(quorum_n: usize) -> Self {
+        Self {
+            votes: HashMap::new(),
+            finalized_h: 0,
+            quorum_n,
+        }
+    }
+
+    pub fn quorum_n(&self) -> usize {
+        self.quorum_n
+    }
+    pub fn finalized(&self) -> u64 {
+        self.finalized_h
+    }
+
+    /// Регистрируем голос. Возвращает Some((h,hash)) если по hash достигнут кворум.
+    pub fn vote(&mut self, h: u64, block_hash: &str, rid_b58: &str) -> Option<(u64, String)> {
+        let by_hash = self.votes.entry(h).or_default();
+        let set = by_hash.entry(block_hash.to_string()).or_default();
+        set.insert(rid_b58.to_string());
+        if set.len() >= self.quorum_n {
+            if h > self.finalized_h {
+                self.finalized_h = h;
+            }
+            return Some((h, block_hash.to_string()));
+        }
+        None
+    }
+
+    /// Сколько голосов у конкретного (h,hash)
+    #[allow(dead_code)]
+    pub fn votes_for(&self, h: u64, block_hash: &str) -> usize {
+        self.votes
+            .get(&h)
+            .and_then(|m| m.get(block_hash))
+            .map(|s| s.len())
+            .unwrap_or(0)
+    }
+}
+
+```
+
+
+=== /root/logos_lrb/lrb_core/src/phase_filters.rs ===
+
+```rust
+use crate::types::Block;
+
+/// Простые фазовые фильтры на основе гармоник Λ0.
+/// ENV (всё опционально):
+///  LRB_PHASE_EN=1|0                     (вкл/выкл, по умолчанию 1)
+///  LRB_PHASE_FREQS_HZ="7.83,1.618,432"  (частоты, через запятую)
+///  LRB_PHASE_MIN_SCORE=-0.20            (порог принятия от -1.0 до 1.0)
+///
+/// Идея: время блока b.timestamp_ms в секундах подаётся в сумму косинусов.
+/// score = avg_i cos(2π f_i * t)
+/// Пропускаем, если score >= MIN_SCORE.
+fn phase_enabled() -> bool {
+    std::env::var("LRB_PHASE_EN")
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or(true)
+}
+fn parse_freqs() -> Vec<f64> {
+    let def = "7.83,1.618,432";
+    let raw = std::env::var("LRB_PHASE_FREQS_HZ").unwrap_or_else(|_| def.to_string());
+    raw.split(',')
+        .filter_map(|s| s.trim().parse::<f64>().ok())
+        .collect::<Vec<_>>()
+}
+fn min_score() -> f64 {
+    std::env::var("LRB_PHASE_MIN_SCORE")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(-0.20)
+}
+
+fn phase_score_ts_ms(ts_ms: u128) -> f64 {
+    let t = ts_ms as f64 / 1000.0;
+    let freqs = parse_freqs();
+    if freqs.is_empty() {
+        return 1.0;
+    }
+    let two_pi = std::f64::consts::TAU; // 2π
+    let mut acc = 0.0;
+    for f in &freqs {
+        acc += (two_pi * *f * t).cos();
+    }
+    acc / (freqs.len() as f64)
+}
+
+/// Главный фильтр на блок: пропускает, если фазовый скор >= порога
+pub fn block_passes_phase(b: &Block) -> bool {
+    if !phase_enabled() {
+        return true;
+    }
+    phase_score_ts_ms(b.timestamp_ms) >= min_score()
+}
+
+```
+
+
+=== /root/logos_lrb/lrb_core/src/phase_integrity.rs ===
+
+```rust
+use crate::types::*;
+use anyhow::{anyhow, Result};
+use ed25519_dalek::Verifier as _; // для pk.verify(&msg, &sig)
+
+pub fn verify_tx_signature(tx: &Tx) -> Result<()> {
+    tx.validate_shape()?;
+
+    let pk = crate::types::parse_pubkey(&tx.public_key)?;
+    let sig = crate::types::parse_sig(&tx.signature)?;
+    let msg = tx.canonical_bytes();
+
+    pk.verify(&msg, &sig)
+        .map_err(|e| anyhow!("bad signature: {e}"))?;
+
+    // сверяем id
+    if tx.id != tx.compute_id() {
+        return Err(anyhow!("tx id mismatch"));
+    }
+    Ok(())
+}
+
+```
+
+
+=== /root/logos_lrb/lrb_core/src/quorum.rs ===
+
+```rust
+use anyhow::Result;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use serde::{Deserialize, Serialize};
+
+/// Голос за блок (по Σ-дайджесту)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Vote {
+    pub height: u64,
+    pub block_hash: String,
+    pub sigma_hex: String,
+    pub voter_pk_b58: String,
+    pub sig_b64: String,
+    pub nonce_ms: u128,
+}
+
+pub fn verify_vote(v: &Vote) -> Result<()> {
+    let pk_bytes = bs58::decode(&v.voter_pk_b58).into_vec()?;
+    let vk =
+        VerifyingKey::from_bytes(&pk_bytes.try_into().map_err(|_| anyhow::anyhow!("bad pk"))?)?;
+    let sig_bytes = B64.decode(v.sig_b64.as_bytes())?;
+    let sig = Signature::from_bytes(
+        &sig_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("bad sig"))?,
+    );
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(v.sigma_hex.as_bytes());
+    payload.extend_from_slice(v.block_hash.as_bytes());
+    payload.extend_from_slice(&v.height.to_le_bytes());
+    payload.extend_from_slice(&v.nonce_ms.to_le_bytes());
+
+    vk.verify(&payload, &sig)
+        .map_err(|e| anyhow::anyhow!("verify failed: {e}"))?;
+    Ok(())
+}
+
+```
+
+
+=== /root/logos_lrb/lrb_core/src/rcp_engine.rs ===
+
+```rust
+use crate::sigpool::filter_valid_sigs_parallel;
+use crate::{dynamic_balance::DynamicBalance, ledger::Ledger, spam_guard::SpamGuard, types::*};
+use crate::{phase_consensus::PhaseConsensus, phase_filters::block_passes_phase};
+use anyhow::Result;
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::sync::{
+    broadcast,
+    mpsc::{unbounded_channel, UnboundedSender},
+};
+
+// точный монотонный ts для индексации
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn env_u64(key: &str, def: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(def)
+}
+fn env_usize(key: &str, def: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(def)
+}
+
+#[derive(Clone)]
+pub struct Engine {
+    ledger: Arc<Ledger>,
+    guard: SpamGuard,
+    dyn_cost: DynamicBalance,
+    proposer: Rid,
+    mempool_tx: UnboundedSender<Tx>,
+    mempool: Arc<Mutex<Vec<Tx>>>,
+    commit_tx: Arc<Mutex<Option<broadcast::Sender<Block>>>>,
+
+    slot_ms: u64,
+    sig_workers: usize,
+    consensus: Arc<Mutex<PhaseConsensus>>,
+}
+
+impl Engine {
+    pub fn new(ledger: Ledger, proposer: Rid) -> Arc<Self> {
+        let mempool_cap = env_u64("LRB_MEMPOOL_CAP", 100_000);
+        let max_block_tx = env_u64("LRB_MAX_BLOCK_TX", 10_000);
+        let max_amount = env_u64("LRB_MAX_AMOUNT", u64::MAX / 2);
+        let slot_ms = env_u64("LRB_SLOT_MS", 500);
+        let quorum_n = env_usize("LRB_QUORUM_N", 1);
+        let sig_workers = env_usize("LRB_SIG_WORKERS", 4);
+
+        let mempool: Arc<Mutex<Vec<Tx>>> = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = unbounded_channel::<Tx>();
+
+        let engine = Arc::new(Self {
+            ledger: Arc::new(ledger),
+            guard: SpamGuard::new(mempool_cap as usize, max_block_tx as usize, max_amount),
+            dyn_cost: DynamicBalance::new(100, 2),
+            proposer,
+            mempool_tx: tx.clone(),
+            mempool: mempool.clone(),
+            commit_tx: Arc::new(Mutex::new(None)),
+            slot_ms,
+            sig_workers,
+            consensus: Arc::new(Mutex::new(PhaseConsensus::new(quorum_n))),
+        });
+
+        // приём транзакций в mempool с лимитами
+        let guard = engine.guard.clone();
+        tokio::spawn(async move {
+            let mut rx = rx;
+            while let Some(tx) = rx.recv().await {
+                let mut lock = mempool.lock().unwrap();
+                if guard.check_mempool(lock.len()).is_ok() {
+                    lock.push(tx);
+                }
+            }
+        });
+
+        engine
+    }
+
+    pub fn ledger(&self) -> Arc<Ledger> {
+        self.ledger.clone()
+    }
+    pub fn proposer(&self) -> Rid {
+        self.proposer.clone()
+    }
+    pub fn set_commit_notifier(&self, sender: broadcast::Sender<Block>) {
+        *self.commit_tx.lock().unwrap() = Some(sender);
+    }
+    pub fn check_amount_valid(&self, amount: u64) -> Result<()> {
+        self.guard.check_amount(amount)
+    }
+    pub fn mempool_sender(&self) -> UnboundedSender<Tx> {
+        self.mempool_tx.clone()
+    }
+    pub fn mempool_len(&self) -> usize {
+        self.mempool.lock().unwrap().len()
+    }
+    pub fn finalized_height(&self) -> u64 {
+        self.consensus.lock().unwrap().finalized()
+    }
+
+    pub fn register_vote(&self, height: u64, block_hash: &str, rid_b58: &str) -> bool {
+        let mut cons = self.consensus.lock().unwrap();
+        if let Some((h, voted_hash)) = cons.vote(height, block_hash, rid_b58) {
+            if let Ok(local) = self.ledger.get_block_by_height(h) {
+                if local.block_hash == voted_hash {
+                    let _ = self.ledger.set_finalized(h);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub async fn run_block_producer(self: Arc<Self>) -> Result<()> {
+        let mut interval = tokio::time::interval(Duration::from_millis(self.slot_ms));
+
+        loop {
+            interval.tick().await;
+
+            // 1) забираем пачку из мемпула
+            let raw = {
+                let mut mp = self.mempool.lock().unwrap();
+                if mp.is_empty() {
+                    continue;
+                }
+                let take = self.guard.max_block_txs().min(mp.len());
+                mp.drain(0..take).collect::<Vec<Tx>>()
+            };
+
+            // 2) проверка подписей параллельно
+            let mut valid = filter_valid_sigs_parallel(raw, self.sig_workers).await;
+            if valid.is_empty() {
+                continue;
+            }
+
+            // 3) базовые лимиты/amount
+            valid.retain(|t| self.guard.check_amount(t.amount).is_ok());
+            if valid.is_empty() {
+                continue;
+            }
+
+            // 4) формируем блок (h+1)
+            let (h, prev_hash) = self.ledger.head().unwrap_or((0, String::new()));
+            let b = Block::new(h + 1, prev_hash, self.proposer.clone(), valid);
+
+            // 5) фазовый фильтр (резонанс). Если не прошёл — НЕ теряем tx: возвращаем в хвост mempool.
+            if !block_passes_phase(&b) {
+                let mut mp = self.mempool.lock().unwrap();
+                mp.extend(b.txs.into_iter()); // вернуть в очередь, обработаем в следующем слоте
+                continue;
+            }
+
+            // 6) атомарный коммит блока
+            if let Err(e) = self.ledger.commit_block_atomic(&b) {
+                // при ошибке — вернуть tx в mempool и идти дальше
+                let mut mp = self.mempool.lock().unwrap();
+                mp.extend(b.txs.into_iter());
+                eprintln!("commit_block_atomic error at height {}: {:?}", b.height, e);
+                continue;
+            }
+
+            // 7) индексирование блока для истории/эксплорера (не мешает продюсеру)
+            let ts = now_ms();
+            if let Err(e) = self.ledger.index_block(b.height, &b.block_hash, ts, &b.txs) {
+                // индексация не должна ломать производство блоков
+                eprintln!("index_block error at height {}: {:?}", b.height, e);
+            }
+
+            // 8) локальный голос и уведомление подписчикам
+            let _ = self.register_vote(b.height, &b.block_hash, self.proposer.as_str());
+            if let Some(tx) = self.commit_tx.lock().unwrap().as_ref() {
+                let _ = tx.send(b.clone());
+            }
+        }
+    }
+
+    pub fn lgn_cost_microunits(&self) -> u64 {
+        self.dyn_cost.lgn_cost(self.mempool_len() as usize)
+    }
+}
+
+pub fn engine_with_channels(ledger: Ledger, proposer: Rid) -> (Arc<Engine>, UnboundedSender<Tx>) {
+    let engine = Engine::new(ledger, proposer);
+    let sender = engine.mempool_sender();
+    (engine, sender)
+}
+
+```
+
+
+=== /root/logos_lrb/lrb_core/src/resonance.rs ===
+
+```rust
+use crate::types::{Block, Tx};
+use blake3::Hasher;
+
+/// Гармоники Λ0/Σ(t) — фиксированное «зерно» резонанса.
+const HARMONICS: &[&[u8]] = &[
+    b"f1=7.83Hz",
+    b"f2=1.618Hz",
+    b"f3=432Hz",
+    b"f4=864Hz",
+    b"f5=3456Hz",
+    b"L0=LOGOS-PRIME",
+];
+
+fn mix_tx(hasher: &mut Hasher, tx: &Tx) {
+    // Канон: id + from + to + amount + nonce + pk
+    hasher.update(tx.id.as_bytes());
+    hasher.update(tx.from.0.as_bytes());
+    hasher.update(tx.to.0.as_bytes());
+    hasher.update(&tx.amount.to_le_bytes());
+    hasher.update(&tx.nonce.to_le_bytes());
+    hasher.update(&tx.public_key);
+}
+
+/// Σ-дайджест блока (hex), детерминированный и инвариантный.
+pub fn sigma_digest_block_hex(b: &Block) -> String {
+    let mut h = Hasher::new();
+    for tag in HARMONICS {
+        h.update(tag);
+    }
+    h.update(b.prev_hash.as_bytes());
+    h.update(b.proposer.0.as_bytes());
+    h.update(&b.height.to_le_bytes());
+    h.update(&b.timestamp_ms.to_le_bytes());
+    for tx in &b.txs {
+        mix_tx(&mut h, tx)
+    }
+    hex::encode(h.finalize().as_bytes())
+}
+
+```
+
+
+=== /root/logos_lrb/lrb_core/src/sigpool.rs ===
+
+```rust
+use crate::phase_integrity::verify_tx_signature;
+use crate::types::Tx;
+use tokio::task::JoinSet;
+
+/// Параллельная фильтрация валидных по подписи транзакций.
+/// workers: количество тасков; по умолчанию 4–8 (задать через ENV в движке).
+pub async fn filter_valid_sigs_parallel(txs: Vec<Tx>, workers: usize) -> Vec<Tx> {
+    if txs.is_empty() {
+        return txs;
+    }
+    let w = workers.max(1);
+    let chunk = (txs.len() + w - 1) / w;
+    let mut set = JoinSet::new();
+    for part in txs.chunks(chunk) {
+        let vec = part.to_vec();
+        set.spawn(async move {
+            let mut ok = Vec::with_capacity(vec.len());
+            for t in vec {
+                if verify_tx_signature(&t).is_ok() {
+                    ok.push(t);
+                }
+            }
+            ok
+        });
+    }
+    let mut out = Vec::new();
+    while let Some(res) = set.join_next().await {
+        if let Ok(mut v) = res {
+            out.append(&mut v);
+        }
+    }
+    out
+}
+
+```
+
+
+=== /root/logos_lrb/lrb_core/src/spam_guard.rs ===
+
+```rust
+use anyhow::{anyhow, Result};
+
+#[derive(Clone, Debug)]
+pub struct SpamGuard {
+    max_mempool: usize,
+    max_tx_per_block: usize,
+    max_amount: u64,
+}
+
+impl SpamGuard {
+    pub fn new(max_mempool: usize, max_tx_per_block: usize, max_amount: u64) -> Self {
+        Self {
+            max_mempool,
+            max_tx_per_block,
+            max_amount,
+        }
+    }
+    pub fn check_mempool(&self, cur_len: usize) -> Result<()> {
+        if cur_len > self.max_mempool {
+            return Err(anyhow!("mempool overflow"));
+        }
+        Ok(())
+    }
+    pub fn check_amount(&self, amount: u64) -> Result<()> {
+        if amount == 0 || amount > self.max_amount {
+            return Err(anyhow!("amount out of bounds"));
+        }
+        Ok(())
+    }
+    pub fn max_block_txs(&self) -> usize {
+        self.max_tx_per_block
+    }
+}
+
+```
+
+
+=== /root/logos_lrb/lrb_core/src/types.rs ===
+
+```rust
+use anyhow::{anyhow, Result};
+use blake3::Hasher;
+use ed25519_dalek::{Signature, VerifyingKey};
+use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
+
+// base64 v0.22 Engine API
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
+
+pub type Amount = u64;
+pub type Height = u64;
+pub type Nonce = u64;
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
+pub struct Rid(pub String); // base58(VerifyingKey)
+
+impl Rid {
+    pub fn from_pubkey(pk: &VerifyingKey) -> Self {
+        Rid(bs58::encode(pk.to_bytes()).into_string())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Tx {
+    pub id: String, // blake3 of canonical form
+    pub from: Rid,  // base58(pubkey)
+    pub to: Rid,
+    pub amount: Amount,
+    pub nonce: Nonce,
+    pub public_key: Vec<u8>, // 32 bytes (VerifyingKey)
+    pub signature: Vec<u8>,  // 64 bytes (Signature)
+}
+
+impl Tx {
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        // Без id и signature для детерминированного хеша
+        let m = serde_json::json!({
+            "from": self.from.as_str(),
+            "to": self.to.as_str(),
+            "amount": self.amount,
+            "nonce": self.nonce,
+            "public_key": B64.encode(&self.public_key),
+        });
+        serde_json::to_vec(&m).expect("canonical json")
+    }
+    pub fn compute_id(&self) -> String {
+        let mut hasher = Hasher::new();
+        hasher.update(&self.canonical_bytes());
+        hex::encode(hasher.finalize().as_bytes())
+    }
+    pub fn validate_shape(&self) -> Result<()> {
+        if self.public_key.len() != 32 {
+            return Err(anyhow!("bad pubkey len"));
+        }
+        if self.signature.len() != 64 {
+            return Err(anyhow!("bad signature len"));
+        }
+        if self.amount == 0 {
+            return Err(anyhow!("amount must be > 0"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Block {
+    pub height: Height,
+    pub prev_hash: String,
+    pub timestamp_ms: u128,
+    pub proposer: Rid,
+    pub txs: Vec<Tx>,
+    pub block_hash: String,
+    pub uuid: String, // для логов
+}
+
+impl Block {
+    pub fn new(height: Height, prev_hash: String, proposer: Rid, txs: Vec<Tx>) -> Self {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let mut h = Hasher::new();
+        h.update(prev_hash.as_bytes());
+        h.update(proposer.as_str().as_bytes());
+        for tx in &txs {
+            h.update(tx.id.as_bytes());
+        }
+        h.update(&ts.to_le_bytes());
+        let block_hash = hex::encode(h.finalize().as_bytes());
+        Block {
+            height,
+            prev_hash,
+            timestamp_ms: ts,
+            proposer,
+            txs,
+            block_hash,
+            uuid: Uuid::new_v4().to_string(),
+        }
+    }
+}
+
+pub fn parse_pubkey(pk: &[u8]) -> Result<VerifyingKey> {
+    let arr: [u8; 32] = pk.try_into().map_err(|_| anyhow!("bad pubkey len"))?;
+    Ok(VerifyingKey::from_bytes(&arr)?)
+}
+
+pub fn parse_sig(sig: &[u8]) -> Result<Signature> {
+    let arr: [u8; 64] = sig.try_into().map_err(|_| anyhow!("bad signature len"))?;
+    Ok(Signature::from_bytes(&arr))
+}
+
+```
+
+
+---
+
+# 5. node (исходники + Cargo)
+
+
+
+=== /root/logos_lrb/node/build.rs ===
+
+```rust
+use std::{env, fs, path::PathBuf, process::Command};
+
+fn main() {
+    // Короткий git hash
+    let git_hash = Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| if o.status.success() {
+            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+        } else { None })
+        .unwrap_or_else(|| "unknown".into());
+
+    // Текущая ветка
+    let git_branch = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| if o.status.success() {
+            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+        } else { None })
+        .unwrap_or_else(|| "unknown".into());
+
+    // Время сборки (UTC, RFC3339)
+    let ts = chrono::Utc::now().to_rfc3339();
+
+    // Версия из Cargo.toml
+    let pkg_ver = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
+
+    // Пишем build_info.rs в OUT_DIR
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+    let dest = out_dir.join("build_info.rs");
+    let contents = format!(
+        "pub const BUILD_GIT_HASH: &str = \"{git_hash}\";\n\
+         pub const BUILD_GIT_BRANCH: &str = \"{git_branch}\";\n\
+         pub const BUILD_TIMESTAMP_RFC3339: &str = \"{ts}\";\n\
+         pub const BUILD_PKG_VERSION: &str = \"{pkg_ver}\";\n"
+    );
+    fs::write(&dest, contents).expect("write build_info.rs failed");
+
+    // Ретриггер
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../Cargo.toml");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+}
+
+```
+
+
+=== /root/logos_lrb/node/Cargo.toml ===
+
+```toml
+[dependencies]
+# базовые
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1.47", features = ["rt-multi-thread","macros","signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter","fmt"] }
+
+# внешние, требуемые кодом узла
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json"] }
+base64 = "0.22"
+ring = "0.17"
+constant_time_eq = "0.3"
+sled = "0.34"
+rand = "0.8"
+blake3 = "1.8.2"
+hex = "0.4.3"
+prometheus = "0.13"
+once_cell = "1"
+
+# связь с ядром
+lrb_core = { path = "../lrb_core" }
+[package]
+name    = "logos_node"
+version = "0.1.0"
+edition = "2021"
+
+```
+
+
+=== /root/logos_lrb/node/src/admin.rs ===
+
+```rust
+use axum::{extract::State, http::HeaderMap, response::IntoResponse, Json};
+use serde::Deserialize;
+use std::sync::Arc;
+use serde_json::json;
+
+use crate::state::AppState;
+use crate::auth::require_admin;
+use crate::metrics::inc_total;
+
+#[derive(Deserialize)] pub struct SetBalanceReq { pub rid: String, pub amount: u128 }
+#[derive(Deserialize)] pub struct BumpNonceReq  { pub rid: String }
+#[derive(Deserialize)] pub struct SetNonceReq   { pub rid: String, pub value: u64 }
+#[derive(Deserialize)] pub struct MintReq       { pub amount: u64 }
+#[derive(Deserialize)] pub struct BurnReq       { pub amount: u64 }
+
+pub async fn set_balance(State(app): State<Arc<AppState>>, headers: HeaderMap, Json(req): Json<SetBalanceReq>) -> impl IntoResponse {
+    inc_total("admin_set_balance");
+    if let Err(e) = require_admin(&headers) { return Json(json!({"ok":false,"err":e.to_string()})); }
+    let l = app.ledger.lock();
+    match l.set_balance(&req.rid, req.amount) { Ok(_) => Json(json!({"ok":true})), Err(e)=>Json(json!({"ok":false,"err":e.to_string()})) }
+}
+pub async fn bump_nonce(State(app): State<Arc<AppState>>, headers: HeaderMap, Json(req): Json<BumpNonceReq>) -> impl IntoResponse {
+    inc_total("admin_bump_nonce");
+    if let Err(e) = require_admin(&headers) { return Json(json!({"ok":false,"err":e.to_string()})); }
+    let l = app.ledger.lock();
+    match l.bump_nonce(&req.rid) { Ok(n)=>Json(json!({"ok":true,"nonce":n})), Err(e)=>Json(json!({"ok":false,"err":e.to_string()})) }
+}
+pub async fn set_nonce(State(app): State<Arc<AppState>>, headers: HeaderMap, Json(req): Json<SetNonceReq>) -> impl IntoResponse {
+    inc_total("admin_set_nonce");
+    if let Err(e) = require_admin(&headers) { return Json(json!({"ok":false,"err":e.to_string()})); }
+    let l = app.ledger.lock();
+    match l.set_nonce(&req.rid, req.value) { Ok(_)=>Json(json!({"ok":true,"nonce":req.value})), Err(e)=>Json(json!({"ok":false,"err":e.to_string()})) }
+}
+pub async fn mint(State(app): State<Arc<AppState>>, headers: HeaderMap, Json(req): Json<MintReq>) -> impl IntoResponse {
+    inc_total("admin_mint");
+    if let Err(e) = require_admin(&headers) { return Json(json!({"ok":false,"err":e.to_string()})); }
+    let l = app.ledger.lock();
+    match l.add_minted(req.amount) { Ok(net)=>Json(json!({"ok":true,"net_supply":net})), Err(e)=>Json(json!({"ok":false,"err":e.to_string()})) }
+}
+pub async fn burn(State(app): State<Arc<AppState>>, headers: HeaderMap, Json(req): Json<BurnReq>) -> impl IntoResponse {
+    inc_total("admin_burn");
+    if let Err(e) = require_admin(&headers) { return Json(json!({"ok":false,"err":e.to_string()})); }
+    let l = app.ledger.lock();
+    match l.add_burned(req.amount) { Ok(net)=>Json(json!({"ok":true,"net_supply":net})), Err(e)=>Json(json!({"ok":false,"err":e.to_string()})) }
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/api/archive.rs ===
+
+```rust
+use axum::{extract::{Path, State, Query}, http::StatusCode, Json};
+use std::{collections::HashMap, sync::Arc};
+use tracing::error;
+use crate::state::AppState;
+use super::HistoryItem;
+
+pub async fn archive_history(Path(rid):Path<String>, State(app): State<Arc<AppState>>)
+ -> Json<Vec<HistoryItem>>
+{
+    if let Some(arch)=&app.archive {
+        match arch.history_by_rid(&rid, 100, None).await {
+            Ok(list) => {
+                let out = list.into_iter().map(|r| HistoryItem{
+                    txid:r.txid, height:r.height as u64, from:r.from, to:r.to, amount:r.amount as u64,
+                    nonce:r.nonce as u64, ts:r.ts.map(|v| v as u64)
+                }).collect();
+                return Json(out);
+            }
+            Err(e) => error!("archive: history_by_rid failed: {}", e),
+        }
+    }
+    Json(Vec::new())
+}
+
+pub async fn archive_tx(Path(txid):Path<String>, State(app): State<Arc<AppState>>)
+ -> (StatusCode, Json<serde_json::Value>)
+{
+    if let Some(arch)=&app.archive {
+        match arch.tx_by_id(&txid).await {
+            Ok(Some(rec)) => return (StatusCode::OK, Json(rec)),
+            Ok(None)      => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"not found"}))),
+            Err(e)        => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":e.to_string()}))),
+        }
+    }
+    (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"archive disabled"})))
+}
+
+pub async fn archive_blocks(State(app): State<Arc<AppState>>, Query(q): Query<HashMap<String,String>>)
+ -> Json<Vec<crate::archive::BlockRow>>
+{
+    let lim = q.get("limit").and_then(|s| s.parse::<i64>().ok()).unwrap_or(50);
+    let before = q.get("before_height").and_then(|s| s.parse::<i64>().ok());
+    if let Some(arch)=&app.archive {
+        if let Ok(list)=arch.recent_blocks(lim, before).await { return Json(list); }
+    }
+    Json(Vec::new())
+}
+
+pub async fn archive_txs(State(app): State<Arc<AppState>>, Query(q): Query<HashMap<String,String>>)
+ -> Json<Vec<crate::archive::TxRecord>>
+{
+    let lim = q.get("limit").and_then(|s| s.parse::<i64>().ok()).unwrap_or(100);
+    let rid = q.get("rid").map(|s| s.as_str());
+    let before_ts = q.get("before_ts").and_then(|s| s.parse::<i64>().ok());
+    if let Some(arch)=&app.archive {
+        if let Ok(list)=arch.recent_txs(lim, rid, before_ts).await { return Json(list); }
+    }
+    Json(Vec::new())
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/api/base.rs ===
+
+```rust
+use axum::{extract::{Path, State}, Json};
+use std::sync::Arc;
+use crate::state::AppState;
+use super::{OkMsg, Head, Balance, Economy, HistoryItem};
+
+pub async fn healthz() -> Json<OkMsg> { Json(OkMsg{ status:"ok" }) }
+
+pub async fn head(State(app): State<Arc<AppState>>) -> Json<Head> {
+    let l = app.ledger.lock();
+    let h = l.head_height().unwrap_or(0);
+    let fin = h.saturating_sub(1);
+    Json(Head{ height:h, finalized: fin })
+}
+
+pub async fn balance(Path(rid):Path<String>, State(app): State<Arc<AppState>>) -> Json<Balance> {
+    let l = app.ledger.lock();
+    let bal = l.get_balance(&rid).unwrap_or(0);
+    let n   = l.get_nonce(&rid).unwrap_or(0);
+    Json(Balance{ rid, balance: bal as u128, nonce: n })
+}
+
+pub async fn economy(State(app): State<Arc<AppState>>) -> Json<Economy> {
+    const CAP_MICRO: u64 = 81_000_000_u64 * 1_000_000_u64;
+    let (minted, burned) = app.ledger.lock().supply().unwrap_or((0,0));
+    let supply = minted.saturating_sub(burned);
+    Json(Economy{ supply, burned, cap: CAP_MICRO })
+}
+
+pub async fn history(Path(rid):Path<String>, State(app): State<Arc<AppState>>) -> Json<Vec<HistoryItem>> {
+    let l = app.ledger.lock();
+    let rows = l.account_txs_page(&rid, 0, 100).unwrap_or_default();
+    Json(rows.into_iter().map(|r| HistoryItem{
+        txid:r.txid, height:r.height, from:r.from, to:r.to, amount:r.amount, nonce:r.nonce, ts:Some((r.ts/1000) as u64)
+    }).collect())
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/api/mod.rs ===
+
+```rust
+//! API root: общие типы/утилы + экспорт подмодулей
+
+use serde::{Deserialize, Serialize};
+
+pub mod base;
+pub mod tx;
+pub mod archive;
+pub mod staking;
+
+// ---------- Общие модели ----------
+#[derive(Serialize)]
+pub struct OkMsg { pub status: &'static str }
+
+#[derive(Serialize)]
+pub struct Head { pub height: u64, pub finalized: u64 }
+
+#[derive(Serialize)]
+pub struct Balance { pub rid: String, pub balance: u128, pub nonce: u64 }
+
+#[derive(Deserialize, Clone)]
+pub struct TxIn {
+    pub from:String, pub to:String, pub amount:u64, pub nonce:u64,
+    pub sig_hex:String,
+    #[serde(default)] pub memo:Option<String>
+}
+
+#[derive(Serialize)]
+pub struct SubmitResult { pub ok:bool, #[serde(skip_serializing_if="Option::is_none")] pub txid:Option<String>, pub info:String }
+
+#[derive(Serialize)]
+pub struct SubmitBatchItem { pub ok:bool, #[serde(skip_serializing_if="Option::is_none")] pub txid:Option<String>, pub info:String, pub index:usize }
+
+#[derive(Deserialize)]
+pub struct SubmitBatchReq { pub txs: Vec<TxIn> }
+
+#[derive(Serialize)]
+pub struct Economy { pub supply:u64, pub burned:u64, pub cap:u64 }
+
+#[derive(Serialize)]
+pub struct HistoryItem {
+    pub txid:String, pub height:u64, pub from:String, pub to:String, pub amount:u64, pub nonce:u64,
+    #[serde(skip_serializing_if="Option::is_none")] pub ts:Option<u64>,
+}
+
+// ---------- Утили для подписи ----------
+use sha2::{Sha256, Digest};
+use ed25519_dalek::{Verifier, Signature, VerifyingKey, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
+
+pub fn canonical_msg(from:&str, to:&str, amount:u64, nonce:u64) -> Vec<u8> {
+    let mut h = Sha256::new();
+    h.update(from.as_bytes()); h.update(b"|");
+    h.update(to.as_bytes());   h.update(b"|");
+    h.update(&amount.to_be_bytes()); h.update(b"|");
+    h.update(&nonce.to_be_bytes());
+    h.finalize().to_vec()
+}
+
+pub fn verify_sig(from:&str, msg:&[u8], sig_hex:&str) -> Result<(), String> {
+    let pubkey_bytes = bs58::decode(from).into_vec().map_err(|e| format!("bad_from_rid_base58: {e}"))?;
+    if pubkey_bytes.len() != PUBLIC_KEY_LENGTH {
+        return Err(format!("bad_pubkey_len: got {} want {}", pubkey_bytes.len(), PUBLIC_KEY_LENGTH));
+    }
+    let mut pk_arr = [0u8; PUBLIC_KEY_LENGTH];
+    pk_arr.copy_from_slice(&pubkey_bytes);
+    let vk = VerifyingKey::from_bytes(&pk_arr).map_err(|e| format!("bad_pubkey: {e}"))?;
+
+    let sig_bytes = hex::decode(sig_hex).map_err(|e| format!("bad_sig_hex: {e}"))?;
+    if sig_bytes.len() != SIGNATURE_LENGTH {
+        return Err(format!("bad_sig_len: got {} want {}", sig_bytes.len(), SIGNATURE_LENGTH));
+    }
+    let mut sig_arr = [0u8; SIGNATURE_LENGTH];
+    sig_arr.copy_from_slice(&sig_bytes);
+    let sig = Signature::from_bytes(&sig_arr);
+
+    vk.verify(msg, &sig).map_err(|_| "bad_signature".to_string())
+}
+
+// ---------- Переэкспорт хендлеров ----------
+pub use base::{healthz, head, balance, economy, history};
+pub use tx::{submit_tx, submit_tx_batch};
+pub use archive::{archive_history, archive_tx, archive_blocks, archive_txs};
+pub use staking::{stake_delegate, stake_undelegate, stake_claim, stake_my};
+
+```
+
+
+=== /root/logos_lrb/node/src/api.rs ===
+
+```rust
+use axum::{extract::{Path, State}, response::IntoResponse, Json};
+use serde::Serialize;
+use std::sync::Arc;
+
+use crate::metrics::inc_total;
+use crate::state::AppState;
+use crate::storage::{TxIn, HistoryItem};
+
+#[derive(Serialize)]
+struct OkMsg { status: &'static str }
+
+pub async fn healthz() -> impl IntoResponse {
+    inc_total("healthz");
+    Json(OkMsg{ status: "ok" })
+}
+
+#[derive(Serialize)]
+struct Head { height: u64 }
+
+pub async fn head(State(app): State<Arc<AppState>>) -> impl IntoResponse {
+    inc_total("head");
+    let h = app.ledger.lock().height().unwrap_or(0);
+    Json(Head { height: h })
+}
+
+#[derive(Serialize)]
+struct Balance { rid: String, balance: u128, nonce: u64 }
+
+pub async fn balance(State(app): State<Arc<AppState>>, Path(rid): Path<String>) -> impl IntoResponse {
+    inc_total("balance");
+    let l = app.ledger.lock();
+    let bal = l.get_balance(&rid).unwrap_or(0);
+    let n = l.get_nonce(&rid).unwrap_or(0);
+    Json(Balance { rid, balance: bal, nonce: n })
+}
+
+#[derive(Serialize)]
+struct SubmitResult { ok: bool, txid: Option<String>, info: String }
+
+pub async fn submit_tx(State(app): State<Arc<AppState>>, Json(tx): Json<TxIn>) -> impl IntoResponse {
+    inc_total("submit_tx");
+
+    // 1) Выполняем леджер-операцию в отдельном скоупе (не держим lock через await!)
+    let stx_res = {
+        let l = app.ledger.lock();
+        l.submit_tx_simple(&tx.from, &tx.to, tx.amount, tx.nonce, tx.memo.clone())
+    };
+
+    match stx_res {
+        Ok(stx) => {
+            // 2) После выхода из скоупа мьютекс уже освобождён — теперь можно await
+            if let Some(ref arch) = app.archive {
+                let _ = arch.record_tx(&stx.txid, stx.height, &stx.from, &stx.to, stx.amount, stx.nonce, stx.ts).await;
+            }
+            Json(SubmitResult{ ok: true, txid: Some(stx.txid), info: "accepted".into() })
+        }
+        Err(e)  => Json(SubmitResult{ ok: false, txid: None, info: format!("{}", e) }),
+    }
+}
+
+#[derive(Serialize)]
+struct Economy { supply: u64, burned: u64, cap: u64 }
+
+pub async fn economy(State(app): State<Arc<AppState>>) -> impl IntoResponse {
+    inc_total("economy");
+    let (minted, burned) = app.ledger.lock().supply().unwrap_or((0,0));
+    Json(Economy { supply: minted.saturating_sub(burned), burned, cap: 81_000_000 })
+}
+
+pub async fn history(State(app): State<Arc<AppState>>, Path(rid): Path<String>) -> impl IntoResponse {
+    inc_total("history");
+    let l = app.ledger.lock();
+    let rows = l.account_txs_page(&rid, 0, 100).unwrap_or_default();
+    let list: Vec<HistoryItem> = rows.into_iter().map(|r| HistoryItem{
+        txid: r.txid, height: r.height, from: r.from, to: r.to, amount: r.amount, nonce: r.nonce, ts: r.ts
+    }).collect();
+    Json(list)
+}
+
+/* --- Архив: публичные эндпоинты (async-await) --- */
+
+pub async fn archive_history(State(app): State<Arc<AppState>>, Path(rid): Path<String>) -> impl IntoResponse {
+    inc_total("archive_history");
+    if let Some(ref arch) = app.archive {
+        let v = arch.history_page(&rid, 0, 100).await.unwrap_or_default();
+        return Json(v); // Vec<serde_json::Value>
+    }
+    // архив выключен — возвращаем пустой список того же типа
+    Json(Vec::<serde_json::Value>::new())
+}
+
+pub async fn archive_tx(State(app): State<Arc<AppState>>, Path(txid): Path<String>) -> impl IntoResponse {
+    inc_total("archive_tx");
+    if let Some(ref arch) = app.archive {
+        let v = arch.get_tx(&txid).await.unwrap_or(None);
+        return Json(serde_json::json!({ "ok": v.is_some(), "tx": v }));
+    }
+    Json(serde_json::json!({"ok":false,"err":"archive disabled"}))
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/api/staking.rs ===
+
+```rust
+use axum::{extract::{Path}, http::StatusCode, Json};
+use serde::{Deserialize, Serialize};
+use reqwest::Client;
+
+#[derive(Deserialize, Serialize)]
+pub struct StakeAction {
+    pub rid: String,
+    #[serde(default)] pub validator: String,
+    #[serde(default)] pub amount: Option<u64>,
+}
+
+pub async fn stake_delegate(Json(body):Json<StakeAction>) -> (StatusCode, String) {
+    let cli = Client::new();
+    let resp = cli.post("http://127.0.0.1:8080/stake/submit")
+        .json(&serde_json::json!({"action":"delegate","rid":body.rid,"validator":body.validator,"amount":body.amount}))
+        .send().await;
+    match resp {
+        Ok(r) => (StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::OK), r.text().await.unwrap_or_default()),
+        Err(e)=> (StatusCode::BAD_GATEWAY, format!("proxy_error: {e}")),
+    }
+}
+
+pub async fn stake_undelegate(Json(body):Json<StakeAction>) -> (StatusCode, String) {
+    let cli = Client::new();
+    let resp = cli.post("http://127.0.0.1:8080/stake/submit")
+        .json(&serde_json::json!({"action":"undelegate","rid":body.rid,"validator":body.validator,"amount":body.amount}))
+        .send().await;
+    match resp {
+        Ok(r) => (StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::OK), r.text().await.unwrap_or_default()),
+        Err(e)=> (StatusCode::BAD_GATEWAY, format!("proxy_error: {e}")),
+    }
+}
+
+pub async fn stake_claim(Json(body):Json<StakeAction>) -> (StatusCode, String) {
+    let cli = Client::new();
+    let resp = cli.post("http://127.0.0.1:8080/stake/submit")
+        .json(&serde_json::json!({"action":"claim","rid":body.rid}))
+        .send().await;
+    match resp {
+        Ok(r) => (StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::OK), r.text().await.unwrap_or_default()),
+        Err(e)=> (StatusCode::BAD_GATEWAY, format!("proxy_error: {e}")),
+    }
+}
+
+pub async fn stake_my(Path(rid):Path<String>) -> (StatusCode, String) {
+    let cli = Client::new();
+
+    let dtext = match cli.get(format!("http://127.0.0.1:8080/stake/delegations/{rid}")).send().await {
+        Ok(resp) => resp.text().await.unwrap_or_else(|_| "[]".to_string()),
+        Err(_)   => "[]".to_string(),
+    };
+
+    let rtext = match cli.get(format!("http://127.0.0.1:8080/stake/rewards/{rid}")).send().await {
+        Ok(resp) => resp.text().await.unwrap_or_else(|_| "[]".to_string()),
+        Err(_)   => "[]".to_string(),
+    };
+
+    let body = serde_json::json!({
+        "delegations": serde_json::from_str::<serde_json::Value>(&dtext).unwrap_or(serde_json::json!([])),
+        "rewards":     serde_json::from_str::<serde_json::Value>(&rtext).unwrap_or(serde_json::json!([]))
+    });
+    (StatusCode::OK, body.to_string())
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/api/tx.rs ===
+
+```rust
+use axum::{extract::State, http::StatusCode, Json};
+use std::sync::Arc;
+use tracing::{info,warn,error};
+use crate::{state::AppState, metrics};
+use super::{TxIn, SubmitResult, SubmitBatchReq, SubmitBatchItem, canonical_msg, verify_sig};
+
+pub async fn submit_tx(State(app): State<Arc<AppState>>, Json(tx):Json<TxIn>)
+    -> (StatusCode, Json<SubmitResult>)
+{
+    let msg = canonical_msg(&tx.from, &tx.to, tx.amount, tx.nonce);
+    if let Err(e) = verify_sig(&tx.from, &msg, &tx.sig_hex) {
+        metrics::inc_tx_rejected("bad_signature");
+        return (StatusCode::UNAUTHORIZED, Json(SubmitResult{ ok:false, txid:None, info:e }));
+    }
+    let prev = app.ledger.lock().get_nonce(&tx.from).unwrap_or(0);
+    if tx.nonce <= prev {
+        metrics::inc_tx_rejected("nonce_reuse");
+        return (StatusCode::CONFLICT, Json(SubmitResult{ ok:false, txid:None, info:"nonce_reuse".into() }));
+    }
+    let stx = match app.ledger.lock().submit_tx_simple(&tx.from, &tx.to, tx.amount, tx.nonce, tx.memo.clone()){
+        Ok(s)=>s, Err(e)=>{
+            metrics::inc_tx_rejected("internal");
+            return (StatusCode::OK, Json(SubmitResult{ ok:false, txid:None, info:e.to_string() }))
+        },
+    };
+    if let Some(arch)=&app.archive {
+        match arch.record_tx(&stx.txid, stx.height, &stx.from, &stx.to, stx.amount, stx.nonce, Some((stx.ts/1000) as u64)).await {
+            Ok(()) => info!("archive: wrote tx {}", stx.txid),
+            Err(e) => error!("archive: write failed: {}", e),
+        }
+    } else { warn!("archive: not configured"); }
+
+    metrics::inc_tx_accepted();
+    (StatusCode::OK, Json(SubmitResult{ ok:true, txid:Some(stx.txid), info:"accepted".into() }))
+}
+
+pub async fn submit_tx_batch(State(app): State<Arc<AppState>>, Json(req):Json<SubmitBatchReq>)
+    -> (StatusCode, Json<Vec<SubmitBatchItem>>)
+{
+    let mut out = Vec::with_capacity(req.txs.len());
+
+    // 1) Пропускаем и коммитим все tx по правилам валидации
+    for (i, tx) in req.txs.into_iter().enumerate() {
+        let msg = canonical_msg(&tx.from, &tx.to, tx.amount, tx.nonce);
+        if let Err(e) = verify_sig(&tx.from, &msg, &tx.sig_hex) {
+            metrics::inc_tx_rejected("bad_signature");
+            out.push(SubmitBatchItem{ ok:false, txid:None, info:e, index:i });
+            continue;
+        }
+        let prev = app.ledger.lock().get_nonce(&tx.from).unwrap_or(0);
+        if tx.nonce <= prev {
+            metrics::inc_tx_rejected("nonce_reuse");
+            out.push(SubmitBatchItem{ ok:false, txid:None, info:"nonce_reuse".into(), index:i });
+            continue;
+        }
+        match app.ledger.lock().submit_tx_simple(&tx.from, &tx.to, tx.amount, tx.nonce, tx.memo.clone()) {
+            Ok(s) => { metrics::inc_tx_accepted(); out.push(SubmitBatchItem{ ok:true, txid:Some(s.txid), info:"accepted".into(), index:i }); }
+            Err(e)=> { metrics::inc_tx_rejected("internal"); out.push(SubmitBatchItem{ ok:false, txid:None, info:e.to_string(), index:i }); }
+        }
+    }
+
+    // 2) Batch ingest в архив: СБОР В OWNED-СТРУКТУРУ
+    if let Some(arch)=&app.archive {
+        // собираем только принятые
+        let mut rows: Vec<(String,u64,String,String,u64,u64,Option<u64>)> = Vec::new();
+        for item in &out {
+            if !item.ok { continue; }
+            if let Some(ref txid) = item.txid {
+                // достаём сохранённую tx из ledger
+                if let Ok(Some(stx)) = app.ledger.lock().get_tx(txid) {
+                    rows.push((
+                        txid.clone(),
+                        stx.height,
+                        stx.from.clone(),
+                        stx.to.clone(),
+                        stx.amount as u64,
+                        stx.nonce as u64,
+                        Some((stx.ts/1000) as u64),
+                    ));
+                }
+            }
+        }
+        if !rows.is_empty() {
+            // передаём срез &rows[..] — тип: &[(String,u64,String,String,u64,u64,Option<u64>)]
+            let _ = arch.record_txs_batch(&rows[..]).await;
+        }
+    }
+
+    (StatusCode::OK, Json(out))
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/archive/mod.rs ===
+
+```rust
+//! Postgres archive backend with simple batch insert & backpressure
+
+use deadpool_postgres::{Manager, Pool};
+use tokio_postgres::{NoTls, Row, Config};
+use serde::Serialize;
+use anyhow::Result;
+use crate::metrics;
+
+#[derive(Clone)]
+pub struct Archive { pub(crate) pool: Pool }
+
+impl Archive {
+    pub async fn new_from_env() -> Option<Self> {
+        let url = std::env::var("LRB_ARCHIVE_URL").ok()?;
+        let cfg: Config = url.parse().ok()?;
+        let mgr = Manager::new(cfg, NoTls);
+        let pool = Pool::builder(mgr).max_size(16).build().ok()?;
+        Some(Archive { pool })
+    }
+
+    pub async fn record_tx(&self, txid:&str, height:u64, from:&str, to:&str, amount:u64, nonce:u64, ts:Option<u64>) -> Result<()> {
+        let client = self.pool.get().await?;
+        client.execute(
+            "insert into txs (txid,height,from_rid,to_rid,amount,nonce,ts) values ($1,$2,$3,$4,$5,$6,to_timestamp($7))",
+            &[&txid, &(height as i64), &from, &to, &(amount as i64), &(nonce as i64), &(ts.unwrap_or(0) as i64)]
+        ).await?;
+        Ok(())
+    }
+
+    /// Batch-ingest (owned строки → без проблем с лайфтаймами)
+    pub async fn record_txs_batch(
+        &self,
+        rows:&[(String,u64,String,String,u64,u64,Option<u64>)]
+    ) -> Result<()> {
+        use std::time::Duration;
+        let client = self.pool.get().await?;
+        let depth = rows.len() as i64;
+        metrics::set_archive_queue(depth);
+
+        let stmt = "insert into txs (txid,height,from_rid,to_rid,amount,nonce,ts) \
+                    values ($1,$2,$3,$4,$5,$6,to_timestamp($7)) on conflict do nothing";
+
+        for chunk in rows.chunks(500) {
+            for r in chunk {
+                client.execute(
+                    stmt,
+                    &[&r.0, &(r.1 as i64), &r.2, &r.3, &(r.4 as i64), &(r.5 as i64), &(r.6.unwrap_or(0) as i64)]
+                ).await?;
+            }
+            if chunk.len()==500 { tokio::time::sleep(Duration::from_millis(2)).await; }
+        }
+        metrics::set_archive_queue(0);
+        Ok(())
+    }
+
+    pub async fn history_by_rid(&self, rid:&str, limit:i64, before:Option<i64>) -> Result<Vec<TxRecord>> {
+        let client = self.pool.get().await?;
+        let rows = client.query(
+            "select txid,height,from_rid,to_rid,amount,nonce,extract(epoch from ts)::bigint as ts \
+             from txs where (from_rid=$1 or to_rid=$1) and ($2::bigint is null or height<$2) \
+             order by height desc limit $3",
+            &[&rid, &before, &limit]
+        ).await?;
+        Ok(rows.into_iter().map(TxRecord::from_row).collect())
+    }
+
+    pub async fn tx_by_id(&self, txid:&str) -> Result<Option<serde_json::Value>> {
+        let client = self.pool.get().await?;
+        let row = client.query_opt(
+            "select txid,height,from_rid,to_rid,amount,nonce,extract(epoch from ts)::bigint as ts \
+             from txs where txid=$1", &[&txid]
+        ).await?;
+        Ok(row.map(|r| serde_json::json!(TxRecord::from_row(r))))
+    }
+
+    pub async fn recent_blocks(&self, limit:i64, before:Option<i64>) -> Result<Vec<BlockRow>> {
+        let client = self.pool.get().await?;
+        let rows = client.query(
+            "select height,hash,extract(epoch from ts)::bigint as ts,tx_count \
+             from blocks where ($1::bigint is null or height<$1) order by height desc limit $2",
+            &[&before, &limit]
+        ).await?;
+        Ok(rows.into_iter().map(BlockRow::from_row).collect())
+    }
+
+    pub async fn recent_txs(&self, limit:i64, rid:Option<&str>, before_ts:Option<i64>) -> Result<Vec<TxRecord>> {
+        let client = self.pool.get().await?;
+        let rows = if let Some(rid)=rid {
+            client.query(
+                "select txid,height,from_rid,to_rid,amount,nonce,extract(epoch from ts)::bigint as ts \
+                 from txs where (from_rid=$1 or to_rid=$1) and ($2::bigint is null or extract(epoch from ts)<$2) \
+                 order by ts desc limit $3",
+                &[&rid, &before_ts, &limit]
+            ).await?
+        } else {
+            client.query(
+                "select txid,height,from_rid,to_rid,amount,nonce,extract(epoch from ts)::bigint as ts \
+                 from txs where ($1::bigint is null or extract(epoch from ts)<$1) order by ts desc limit $2",
+                &[&before_ts, &limit]
+            ).await?
+        };
+        Ok(rows.into_iter().map(TxRecord::from_row).collect())
+    }
+
+    // нужен для /archive_block (и может использоваться API)
+    pub async fn block_by_height(&self, h:i64) -> Result<Option<BlockRow>> {
+        let client = self.pool.get().await?;
+        let row = client.query_opt(
+            "select height,hash,extract(epoch from ts)::bigint as ts,tx_count from blocks where height=$1",
+            &[&h]
+        ).await?;
+        Ok(row.map(BlockRow::from_row))
+    }
+}
+
+#[derive(Serialize)]
+pub struct BlockRow { pub height:i64, pub hash:String, pub ts:i64, pub tx_count:i64 }
+impl BlockRow { fn from_row(r:Row)->Self { Self{ height:r.get(0), hash:r.get(1), ts:r.get(2), tx_count:r.get(3) } } }
+
+#[derive(Serialize)]
+pub struct TxRecord { pub txid:String, pub height:i64, pub from:String, pub to:String, pub amount:i64, pub nonce:i64, pub ts:Option<i64> }
+impl TxRecord { fn from_row(r:Row)->Self { Self{
+    txid:r.get(0), height:r.get(1), from:r.get(2), to:r.get(3), amount:r.get(4), nonce:r.get(5), ts:r.get(6)
+}}}
+
+```
+
+
+=== /root/logos_lrb/node/src/archive/pg.rs ===
+
+```rust
+//! Postgres архивация: deadpool-postgres, батч-вставки (prod).
+//! ENV: LRB_ARCHIVE_URL=postgres://user:pass@host:5432/db
+
+use anyhow::Result;
+use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod};
+use tokio_postgres::NoTls;
+
+#[derive(Clone)]
+pub struct ArchivePg {
+    pool: Pool,
+}
+
+impl ArchivePg {
+    pub async fn new(url: &str) -> Result<Self> {
+        // Правильная настройка пула: используем поле `url`
+        let mut cfg = Config::new();
+        cfg.url = Some(url.to_string());
+        cfg.manager = Some(ManagerConfig { recycling_method: RecyclingMethod::Fast });
+        // Можно добавить пул-лимиты при необходимости:
+        // cfg.pool = Some(deadpool_postgres::PoolConfig { max_size: 32, ..Default::default() });
+
+        let pool = cfg.create_pool(Some(deadpool_postgres::Runtime::Tokio1), NoTls)?;
+        let a = Self { pool };
+        a.ensure_schema().await?;
+        Ok(a)
+    }
+
+    async fn ensure_schema(&self) -> Result<()> {
+        let client = self.pool.get().await?;
+        client.batch_execute(r#"
+            CREATE TABLE IF NOT EXISTS tx (
+                txid      TEXT PRIMARY KEY,
+                height    BIGINT NOT NULL,
+                from_rid  TEXT NOT NULL,
+                to_rid    TEXT NOT NULL,
+                amount    BIGINT NOT NULL,
+                nonce     BIGINT NOT NULL,
+                ts        BIGINT
+            );
+            CREATE TABLE IF NOT EXISTS account_tx (
+                rid    TEXT NOT NULL,
+                height BIGINT NOT NULL,
+                txid   TEXT NOT NULL,
+                PRIMARY KEY (rid, height, txid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tx_height ON tx(height);
+            CREATE INDEX IF NOT EXISTS idx_ac_tx_rid_height ON account_tx(rid, height);
+        "#).await?;
+        Ok(())
+    }
+
+    pub async fn record_tx(
+        &self,
+        txid: &str,
+        height: u64,
+        from: &str,
+        to: &str,
+        amount: u64,
+        nonce: u64,
+        ts: Option<u64>
+    ) -> Result<()> {
+        let mut client = self.pool.get().await?; // <- нужен mut для build_transaction()
+        let stmt1 = client.prepare_cached(
+            "INSERT INTO tx(txid,height,from_rid,to_rid,amount,nonce,ts)
+             VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING"
+        ).await?;
+        let stmt2 = client.prepare_cached(
+            "INSERT INTO account_tx(rid,height,txid)
+             VALUES ($1,$2,$3) ON CONFLICT DO NOTHING"
+        ).await?;
+
+        let h = height as i64;
+        let a = amount as i64;
+        let n = nonce as i64;
+        let t = ts.map(|v| v as i64);
+
+        let tr = client.build_transaction().start().await?;
+        tr.execute(&stmt1, &[&txid, &h, &from, &to, &a, &n, &t]).await?;
+        tr.execute(&stmt2, &[&from, &h, &txid]).await?;
+        tr.execute(&stmt2, &[&to,   &h, &txid]).await?;
+        tr.commit().await?;
+        Ok(())
+    }
+
+    pub async fn history_page(&self, rid: &str, page: u32, per_page: u32) -> Result<Vec<serde_json::Value>> {
+        let client = self.pool.get().await?;
+        let per = per_page.clamp(1, 1000) as i64;
+        let offset = (page as i64) * per;
+        let stmt = client.prepare_cached(r#"
+            SELECT t.txid,t.height,t.from_rid,t.to_rid,t.amount,t.nonce,t.ts
+            FROM account_tx a JOIN tx t ON t.txid=a.txid
+            WHERE a.rid=$1
+            ORDER BY t.height DESC
+            LIMIT $2 OFFSET $3
+        "#).await?;
+        let rows = client.query(&stmt, &[&rid, &per, &offset]).await?;
+        Ok(rows.iter().map(|r| {
+            serde_json::json!({
+                "txid":   r.get::<_, String>(0),
+                "height": r.get::<_, i64>(1),
+                "from":   r.get::<_, String>(2),
+                "to":     r.get::<_, String>(3),
+                "amount": r.get::<_, i64>(4),
+                "nonce":  r.get::<_, i64>(5),
+                "ts":     r.get::<_, Option<i64>>(6),
+            })
+        }).collect())
+    }
+
+    pub async fn get_tx(&self, txid: &str) -> Result<Option<serde_json::Value>> {
+        let client = self.pool.get().await?;
+        let stmt = client.prepare_cached(
+            "SELECT txid,height,from_rid,to_rid,amount,nonce,ts FROM tx WHERE txid=$1"
+        ).await?;
+        let row = client.query_opt(&stmt, &[&txid]).await?;
+        Ok(row.map(|r| serde_json::json!({
+            "txid":   r.get::<_, String>(0),
+            "height": r.get::<_, i64>(1),
+            "from":   r.get::<_, String>(2),
+            "to":     r.get::<_, String>(3),
+            "amount": r.get::<_, i64>(4),
+            "nonce":  r.get::<_, i64>(5),
+            "ts":     r.get::<_, Option<i64>>(6),
+        })))
+    }
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/archive/sqlite.rs ===
+
+```rust
+use anyhow::Result;
+use r2d2::{Pool, PooledConnection};
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::{params, OptionalExtension};
+
+#[derive(Clone)]
+pub struct ArchiveSqlite { pool: Pool<SqliteConnectionManager> }
+
+impl ArchiveSqlite {
+    pub fn new_from_env() -> Option<Self> {
+        let path = std::env::var("LRB_ARCHIVE_PATH").ok()?;
+        let mgr  = SqliteConnectionManager::file(path);
+        let pool = Pool::builder().max_size(8).build(mgr).ok()?;
+        let a = Self { pool };
+        a.ensure_schema().ok()?;
+        Some(a)
+    }
+    fn conn(&self) -> Result<PooledConnection<SqliteConnectionManager>> { Ok(self.pool.get()?) }
+    fn ensure_schema(&self) -> Result<()> {
+        let c = self.conn()?;
+        c.execute_batch(r#"
+            PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
+            CREATE TABLE IF NOT EXISTS tx (txid TEXT PRIMARY KEY, height INTEGER, from_rid TEXT, to_rid TEXT, amount INTEGER, nonce INTEGER, ts INTEGER);
+            CREATE TABLE IF NOT EXISTS account_tx (rid TEXT, height INTEGER, txid TEXT, PRIMARY KEY(rid,height,txid));
+            CREATE INDEX IF NOT EXISTS idx_tx_height ON tx(height);
+            CREATE INDEX IF NOT EXISTS idx_ac_tx_rid_height ON account_tx(rid,height);
+        "#)?;
+        Ok(())
+    }
+    pub fn record_tx(&self, txid:&str, h:u64, from:&str, to:&str, amount:u64, nonce:u64, ts:Option<u64>) -> Result<()> {
+        let c = self.conn()?;
+        let tx = c.unchecked_transaction()?;
+        tx.execute("INSERT OR IGNORE INTO tx(txid,height,from_rid,to_rid,amount,nonce,ts) VALUES(?,?,?,?,?,?,?)",
+            params![txid, h as i64, from, to, amount as i64, nonce as i64, ts.map(|v| v as i64)])?;
+        tx.execute("INSERT OR IGNORE INTO account_tx(rid,height,txid) VALUES(?,?,?)", params![from, h as i64, txid])?;
+        tx.execute("INSERT OR IGNORE INTO account_tx(rid,height,txid) VALUES(?,?,?)", params![to,   h as i64, txid])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn history_page(&self, rid:&str, page:u32, per_page:u32) -> Result<Vec<serde_json::Value>> {
+        let c = self.conn()?;
+        let per = per_page.clamp(1,1000) as i64;
+        let offset = (page as i64) * per;
+        let mut st = c.prepare(
+            "SELECT t.txid,t.height,t.from_rid,t.to_rid,t.amount,t.nonce,t.ts \
+             FROM account_tx a JOIN tx t ON t.txid=a.txid \
+             WHERE a.rid=? ORDER BY t.height DESC LIMIT ? OFFSET ?")?;
+        let rows = st.query_map(params![rid, per, offset], |row| Ok(serde_json::json!({
+            "txid": row.get::<_, String>(0)?, "height": row.get::<_, i64>(1)?,
+            "from": row.get::<_, String>(2)?, "to": row.get::<_, String>(3)?,
+            "amount": row.get::<_, i64>(4)?, "nonce": row.get::<_, i64>(5)?,
+            "ts": row.get::<_, Option<i64>>(6)?
+        })))?;
+        let mut out = Vec::with_capacity(per as usize);
+        for it in rows { out.push(it?); }
+        Ok(out)
+    }
+    pub fn get_tx(&self, txid:&str) -> Result<Option<serde_json::Value>> {
+        let c = self.conn()?;
+        let mut st = c.prepare("SELECT txid,height,from_rid,to_rid,amount,nonce,ts FROM tx WHERE txid=?")?;
+        let v = st.query_row(params![txid], |r| Ok(serde_json::json!({
+            "txid": r.get::<_, String>(0)?, "height": r.get::<_, i64>(1)?,
+            "from": r.get::<_, String>(2)?, "to": r.get::<_, String>(3)?,
+            "amount": r.get::<_, i64>(4)?, "nonce": r.get::<_, i64>(5)?,
+            "ts": r.get::<_, Option<i64>>(6)?
+        }))).optional()?;
+        Ok(v)
+    }
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/auth.rs ===
+
+```rust
+//! Auth: bridge key + HMAC + anti-replay + admin stub
+use anyhow::{anyhow, Result};
+use axum::http::HeaderMap;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
+pub fn assert_secrets_on_start() -> Result<()> {
+    for k in ["LRB_JWT_SECRET","LRB_BRIDGE_KEY"] {
+        let v = std::env::var(k).map_err(|_| anyhow!("{k} not set"))?;
+        let bad = ["", "change_me", "changeme", "default", "dev_secret"];
+        if bad.iter().any(|b| v.eq_ignore_ascii_case(b)) { return Err(anyhow!("{k} insecure")); }
+    }
+    Ok(())
+}
+
+// Совместимость для admin.rs (минимальная проверка заголовка)
+pub fn require_admin(_headers:&HeaderMap) -> Result<()> {
+    // при желании тут можно проверить X-Admin-JWT
+    Ok(())
+}
+
+pub fn require_bridge_key(headers: &HeaderMap) -> Result<()> {
+    let expect = std::env::var("LRB_BRIDGE_KEY").map_err(|_| anyhow!("LRB_BRIDGE_KEY CHANGE_ME set"))?;
+    let got = headers.get("X-Bridge-Key").ok_or_else(|| anyhow!("missing X-Bridge-Key"))?
+        .to_str().map_err(|_| anyhow!("invalid X-Bridge-Key"))?;
+    if got != expect { return Err(anyhow!("forbidden: bad bridge key")); }
+    Ok(())
+}
+
+pub fn verify_hmac_and_nonce(headers: &HeaderMap, body: &[u8], db: &sled::Db) -> Result<()> {
+    let key = std::env::var("LRB_BRIDGE_KEY").map_err(|_| anyhow!("LRB_BRIDGE_KEY CHANGE_ME set"))?;
+    let nonce = headers.get("X-Bridge-Nonce").ok_or_else(|| anyhow!("missing X-Bridge-Nonce"))?
+        .to_str().map_err(|_| anyhow!("bad nonce"))?;
+    let sign  = headers.get("X-Bridge-Sign").ok_or_else(|| anyhow!("missing X-Bridge-Sign"))?
+        .to_str().map_err(|_| anyhow!("bad sign"))?;
+
+    let tree = db.open_tree("bridge.replay")?;
+    let key_n = format!("n:{nonce}");
+    if tree.get(&key_n)?.is_some() { return Err(anyhow!("replay")); }
+
+    let mut mac = <Hmac<Sha256>>::new_from_slice(key.as_bytes()).map_err(|_| anyhow!("hmac"))?;
+    mac.update(body);
+    let got = hex::decode(sign).map_err(|_| anyhow!("sign hex"))?;
+    mac.verify_slice(&got).map_err(|_| anyhow!("bad signature"))?;
+
+    tree.insert(key_n.as_bytes(), &[])?;
+    Ok(())
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/bridge_journal.rs ===
+
+```rust
+//! Durable journal for rToken bridge (idempotent ops + retries) on sled.
+
+use serde::{Serialize,Deserialize};
+use sled::IVec;
+use anyhow::{Result,anyhow};
+use std::time::{SystemTime,UNIX_EPOCH};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OpKind { Deposit, Redeem }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OpStatus { Pending, PayoutSent, Confirmed, Redeemed, Failed }
+
+#[derive(Serialize,Deserialize,Clone)]
+pub struct JournalOp{
+    pub op_id:String,
+    pub kind:OpKind,
+    pub rid:String,
+    pub amount:u64,
+    pub ext_txid:String,     // external chain txid / idempotency key
+    pub status:OpStatus,
+    pub created_ms:u64,
+    pub updated_ms:u64,
+    pub retries:u32,
+    pub last_error:Option<String>,
+}
+
+fn now_ms()->u64{
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+pub struct Journal{
+    ops:   sled::Tree,      // j:<op_id> -> JournalOp
+    idx:   sled::Tree,      // x:<ext_txid> -> op_id (idempotency)
+    retry: sled::Tree,      // r:<op_id> -> next_retry_ms
+}
+
+impl Journal{
+    pub fn open(db:&sled::Db)->Result<Self>{
+        Ok(Self{
+            ops:   db.open_tree("bridge_journal.ops")?,
+            idx:   db.open_tree("bridge_journal.idx")?,
+            retry: db.open_tree("bridge_journal.retry")?,
+        })
+    }
+
+    fn ser<T:Serialize>(v:&T)->Vec<u8>{ serde_json::to_vec(v).unwrap() }
+    fn de<T:for<'a> Deserialize<'a>>(v:&IVec)->T{ serde_json::from_slice(v).unwrap() }
+
+    pub fn begin(&self, kind:OpKind, rid:&str, amount:u64, ext:&str)->Result<JournalOp>{
+        if let Some(opid) = self.idx.get(format!("x:{ext}"))?{
+            let id = std::str::from_utf8(&opid).unwrap();
+            return self.get_by_id(id);
+        }
+        let op_id = blake3::hash(
+            format!("{kind:?}:{rid}:{amount}:{ext}:{:?}", now_ms()).as_bytes()
+        ).to_hex().to_string();
+
+        let op = JournalOp{
+            op_id: op_id.clone(),
+            kind, rid: rid.to_string(), amount,
+            ext_txid: ext.to_string(),
+            status: OpStatus::Pending,
+            created_ms: now_ms(), updated_ms: now_ms(),
+            retries:0, last_error:None
+        };
+
+        self.ops.insert(format!("j:{op_id}"), Self::ser(&op))?;
+        self.idx.insert(format!("x:{ext}"), op_id.as_bytes())?;
+        Ok(op)
+    }
+
+    pub fn set_status(&self, op_id:&str, status:OpStatus, err:Option<String>)->Result<()>{
+        let key = format!("j:{op_id}");
+        let Some(v)=self.ops.get(&key)? else { return Err(anyhow!("op not found")); };
+        let mut op:JournalOp = Self::de(&v);
+        op.status = status;
+        op.updated_ms = now_ms();
+        op.last_error = err;
+        self.ops.insert(key, Self::ser(&op))?;
+        Ok(())
+    }
+
+    pub fn schedule_retry(&self, op_id:&str, delay_ms:u64)->Result<()>{
+        let when = now_ms()+delay_ms;
+        self.retry.insert(format!("r:{op_id}"), when.to_be_bytes().to_vec())?;
+        Ok(())
+    }
+
+    pub fn due_retries(&self, limit:usize)->Result<Vec<String>>{
+        let now = now_ms();
+        let mut out=Vec::new();
+        for kv in self.retry.iter(){
+            let (k,v) = kv?;
+            if v.len()==8 {
+                let when = u64::from_be_bytes(v.as_ref().try_into().unwrap());
+                if when <= now {
+                    let key = std::str::from_utf8(&k).unwrap().to_string(); // r:<op_id>
+                    let op_id = key[2..].to_string();
+                    out.push(op_id);
+                    if out.len()>=limit { break; }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn clear_retry(&self, op_id:&str)->Result<()>{
+        self.retry.remove(format!("r:{op_id}"))?;
+        Ok(())
+    }
+
+    pub fn get_by_id(&self, op_id:&str)->Result<JournalOp>{
+        let Some(v)=self.ops.get(format!("j:{op_id}"))? else { return Err(anyhow!("op not found")); };
+        Ok(Self::de(&v))
+    }
+
+    pub fn get_by_ext(&self, ext:&str)->Result<Option<JournalOp>>{
+        if let Some(opid)=self.idx.get(format!("x:{ext}"))?{
+            let id = std::str::from_utf8(&opid).unwrap();
+            return Ok(Some(self.get_by_id(id)?));
+        }
+        Ok(None)
+    }
+
+    pub fn stats(&self)->Result<(u64,u64,u64)>{
+        let (mut pending, mut confirmed, mut redeemed) = (0u64,0u64,0u64);
+        for kv in self.ops.iter(){
+            let (_k,v)=kv?;
+            let op:JournalOp = Self::de(&v);
+            match op.status{
+                OpStatus::Pending      => pending   += 1,
+                OpStatus::PayoutSent   => pending   += 1, // считаем как pending
+                OpStatus::Confirmed    => confirmed += 1,
+                OpStatus::Redeemed     => redeemed  += 1,
+                OpStatus::Failed       => {}
+            }
+        }
+        Ok((pending, confirmed, redeemed))
+    }
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/bridge.rs ===
+
+```rust
+//! rToken bridge: durable journal + idempotency + retry worker + external payout (Send-safe)
+
+use axum::{extract::State, http::StatusCode, Json};
+use serde::Deserialize;
+use std::sync::Arc;
+use tracing::{warn,error};
+
+use crate::{state::AppState, metrics};
+use crate::bridge_journal::{Journal, OpKind, OpStatus, JournalOp};
+use crate::payout_adapter::PayoutAdapter;
+
+#[derive(Deserialize)]
+pub struct DepositReq { pub rid:String, pub amount:u64, pub ext_txid:String }
+#[derive(Deserialize)]
+pub struct RedeemReq  { pub rid:String, pub amount:u64, pub ext_txid:String }
+
+#[inline]
+fn journal(st:&AppState)->Journal { Journal::open(st.sled()).expect("journal") }
+
+/* -------------------- DEPOSIT (strict idempotent) -------------------- */
+pub async fn deposit(State(st):State<Arc<AppState>>, Json(req):Json<DepositReq>) -> (StatusCode,String){
+    let j = journal(&st);
+
+    // begin() создаёт новую опку или возвращает существующую по ext_txid
+    let op = match j.begin(OpKind::Deposit, &req.rid, req.amount, &req.ext_txid){
+        Ok(op)=>op, Err(e)=>return (StatusCode::INTERNAL_SERVER_ERROR, format!("{{\"error\":\"journal_begin:{e}\"}}")),
+    };
+    metrics::inc_bridge("deposit","begin");
+
+    // Idempotency по статусу: повтор «OK» если уже проведено
+    match op.status {
+        OpStatus::Confirmed | OpStatus::Redeemed => {
+            metrics::inc_bridge("deposit","idempotent_ok");
+            return (StatusCode::OK, format!("{{\"ok\":true,\"op_id\":\"{}\"}}", op.op_id));
+        }
+        _ => {}
+    }
+
+    // Кредитуем ТОЛЬКО когда статус Pending/Failed (guard не пересекает await)
+    {
+        let l = st.ledger.lock();
+        let bal  = l.get_balance(&req.rid).unwrap_or(0);
+        let newb = bal.saturating_add(req.amount);
+        if let Err(e) = l.set_balance(&req.rid, newb as u128) {
+            error!("deposit set_balance: {e}");
+            let _ = j.set_status(&op.op_id, OpStatus::Failed, Some(e.to_string()));
+            let _ = j.schedule_retry(&op.op_id, 5_000);
+            metrics::inc_bridge("deposit","failed");
+            return (StatusCode::ACCEPTED, "{\"status\":\"queued\"}".into());
+        }
+    }
+
+    let _ = j.set_status(&op.op_id, OpStatus::Confirmed, None);
+    metrics::inc_bridge("deposit","confirmed");
+    (StatusCode::OK, format!("{{\"ok\":true,\"op_id\":\"{}\"}}", op.op_id))
+}
+
+/* -------------------- REDEEM (idempotent on ext_txid, payout async) -------------------- */
+pub async fn redeem(State(st):State<Arc<AppState>>, Json(req):Json<RedeemReq>) -> (StatusCode,String){
+    let j = journal(&st);
+    let op = match j.begin(OpKind::Redeem, &req.rid, req.amount, &req.ext_txid){
+        Ok(op)=>op, Err(e)=>return (StatusCode::INTERNAL_SERVER_ERROR, format!("{{\"error\":\"journal_begin:{e}\"}}")),
+    };
+    metrics::inc_bridge("redeem","begin");
+
+    // если уже Redeemed — повтор «OK»
+    if matches!(op.status, OpStatus::Redeemed) {
+        metrics::inc_bridge("redeem","idempotent_ok");
+        return (StatusCode::OK, format!("{{\"ok\":true,\"op_id\":\"{}\"}}", op.op_id));
+    }
+
+    // burn локально (без await внутри)
+    {
+        let l = st.ledger.lock();
+        let bal = l.get_balance(&req.rid).unwrap_or(0);
+        if bal < req.amount {
+            metrics::inc_bridge("redeem","insufficient");
+            return (StatusCode::BAD_REQUEST, "{\"error\":\"insufficient\"}".into());
+        }
+        let newb = bal - req.amount;
+        if let Err(e) = l.set_balance(&req.rid, newb as u128) {
+            error!("redeem set_balance: {e}");
+            let _ = j.set_status(&op.op_id, OpStatus::Failed, Some(e.to_string()));
+            let _ = j.schedule_retry(&op.op_id, 5_000);
+            metrics::inc_bridge("redeem","failed");
+            return (StatusCode::ACCEPTED, "{\"status\":\"queued\"}".into());
+        }
+    }
+
+    // внешний payout
+    match PayoutAdapter::from_env() {
+        Ok(adapter) => {
+            if let Err(e) = adapter.send_payout(&req.rid, req.amount, &req.ext_txid).await {
+                error!("payout error: {e}");
+                let _ = j.set_status(&op.op_id, OpStatus::Failed, Some(e.to_string()));
+                let _ = j.schedule_retry(&op.op_id, 30_000);
+                metrics::inc_bridge("redeem","payout_failed");
+                return (StatusCode::ACCEPTED, "{\"status\":\"queued\"}".into());
+            }
+        }
+        Err(e) => {
+            error!("payout adapter init: {e}");
+            let _ = j.set_status(&op.op_id, OpStatus::Failed, Some(e.to_string()));
+            let _ = j.schedule_retry(&op.op_id, 30_000);
+            metrics::inc_bridge("redeem","payout_init_failed");
+            return (StatusCode::ACCEPTED, "{\"status\":\"queued\"}".into());
+        }
+    }
+
+    let _ = j.set_status(&op.op_id, OpStatus::Redeemed, None);
+    metrics::inc_bridge("redeem","redeemed");
+    (StatusCode::OK, format!("{{\"ok\":true,\"op_id\":\"{}\"}}", op.op_id))
+}
+
+/* -------------------- Retry worker -------------------- */
+async fn retry_deposit(st:&AppState, j:&Journal, op:&JournalOp){
+    {
+        let l = st.ledger.lock();
+        let bal  = l.get_balance(&op.rid).unwrap_or(0);
+        let newb = bal.saturating_add(op.amount);
+        if l.set_balance(&op.rid, newb as u128).is_ok(){
+            let _ = j.set_status(&op.op_id, OpStatus::Confirmed, None);
+            metrics::inc_bridge("deposit","confirmed");
+            let _ = j.clear_retry(&op.op_id);
+            return;
+        }
+    }
+    let _ = j.schedule_retry(&op.op_id, 60_000);
+}
+
+async fn retry_redeem(j:&Journal, op:&JournalOp){
+    match PayoutAdapter::from_env() {
+        Ok(adapter) => match adapter.send_payout(&op.rid, op.amount, &op.ext_txid).await {
+            Ok(()) => { let _=j.set_status(&op.op_id, OpStatus::Redeemed, None); metrics::inc_bridge("redeem","redeemed"); let _=j.clear_retry(&op.op_id); }
+            Err(e) => { warn!("retry payout error: {e}"); let _=j.schedule_retry(&op.op_id, 90_000); }
+        },
+        Err(e) => { warn!("retry payout adapter init: {e}"); let _=j.schedule_retry(&op.op_id, 90_000); }
+    }
+}
+
+pub async fn retry_worker(st:Arc<AppState>){
+    let j = journal(&st);
+    loop {
+        if let Ok(list) = j.due_retries(100){
+            for op_id in list {
+                if let Ok(op) = j.get_by_id(&op_id){
+                    match op.kind {
+                        OpKind::Deposit => retry_deposit(&st, &j, &op).await,
+                        OpKind::Redeem  => retry_redeem(&j, &op).await,
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(3_000)).await;
+    }
+}
+
+/* -------------------- Health -------------------- */
+pub async fn health(State(st):State<Arc<AppState>>)->(StatusCode,String){
+    let j = journal(&st);
+    match j.stats(){
+        Ok((p,c,r)) => (StatusCode::OK, format!("{{\"pending\":{p},\"confirmed\":{c},\"redeemed\":{r}}}")),
+        Err(e)      => (StatusCode::INTERNAL_SERVER_ERROR, format!("{{\"error\":\"{e}\"}}")),
+    }
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/fork.rs ===
+
+```rust
+#![allow(dead_code)]
+//! Fork-choice: минимальный детерминированный выбор на базе высоты/хэша.
+//! Совместим с текущими типами ядра (Block из lrb_core::types).
+
+use lrb_core::types::Block;
+
+/// Выбор лучшей ветви из набора кандидатов.
+/// Правила:
+/// 1) Бóльшая высота предпочтительнее.
+/// 2) При равной высоте — лексикографически наименьший block_hash.
+pub fn choose_best<'a>(candidates: &'a [Block]) -> Option<&'a Block> {
+    candidates
+        .iter()
+        .max_by(|a, b| match a.height.cmp(&b.height) {
+            core::cmp::Ordering::Equal => a.block_hash.cmp(&b.block_hash).reverse(),
+            ord => ord,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn mk(h: u64, hash: &str) -> Block {
+        Block {
+            height: h,
+            block_hash: hash.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pick_by_height_then_hash() {
+        let a = mk(10, "ff");
+        let b = mk(12, "aa");
+        let c = mk(12, "bb");
+        let out = choose_best(&[a, b.clone(), c]).unwrap();
+        assert_eq!(out.height, 12);
+        assert_eq!(out.block_hash, "aa");
+    }
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/gossip.rs ===
+
+```rust
+#![allow(dead_code)]
+//! Gossip-утилиты: сериализация/десериализация блоков для пересылки по сети.
+
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use blake3;
+use hex;
+use lrb_core::{phase_filters::block_passes_phase, types::Block};
+use serde::{Deserialize, Serialize};
+
+/// Конверт для публикации блока в сети Gossip.
+#[derive(Serialize, Deserialize)]
+pub struct GossipEnvelope {
+    pub topic: String,
+    pub payload_b64: String,
+    pub sigma_hex: String,
+    pub height: u64,
+}
+
+/// Энкодим блок: base64-пейлоад, sigma_hex = blake3(payload).
+pub fn encode_block(topic: &str, blk: &Block) -> anyhow::Result<GossipEnvelope> {
+    let bytes = serde_json::to_vec(blk)?;
+    let sigma_hex = hex::encode(blake3::hash(&bytes).as_bytes());
+    Ok(GossipEnvelope {
+        topic: topic.to_string(),
+        payload_b64: B64.encode(bytes),
+        sigma_hex,
+        height: blk.height,
+    })
+}
+
+/// Декодим блок из конверта.
+pub fn decode_block(env: &GossipEnvelope) -> anyhow::Result<Block> {
+    let bytes = B64.decode(&env.payload_b64)?;
+    let blk: Block = serde_json::from_slice(&bytes)?;
+    Ok(blk)
+}
+
+/// Пропускает ли блок фазовый фильтр (решение — по самому блоку).
+pub fn pass_phase_filter(env: &GossipEnvelope) -> bool {
+    if let Ok(blk) = decode_block(env) {
+        block_passes_phase(&blk)
+    } else {
+        false
+    }
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/guard.rs ===
+
+```rust
+use axum::{body::Body, http::Request, middleware::Next, response::Response};
+use rand::{thread_rng, Rng};
+use std::time::Duration;
+
+/// Лёгкий фазовый «шум»: джиттер 0–7мс для submit/stake/bridge путей
+pub async fn rate_limit_mw(req: Request<Body>, next: Next) -> Response {
+    let p = req.uri().path();
+    if p.starts_with("/submit_tx") || p.starts_with("/stake/") || p.starts_with("/bridge/") {
+        let jitter = thread_rng().gen_range(0..=7);
+        tokio::time::sleep(Duration::from_millis(jitter)).await;
+    }
+    next.run(req).await
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/health.rs ===
+
+```rust
+//! Health endpoints: /livez (жив) и /readyz (готов)
+
+use axum::{extract::State, http::StatusCode, Json};
+use serde::Serialize;
+use std::sync::Arc;
+use crate::state::AppState;
+
+/// Публичная структура, т.к. используется в сигнатуре `Json<Ready>`
+#[derive(Serialize)]
+pub struct Ready {
+    pub db: bool,
+    pub archive: bool,
+    pub payout_cfg: bool,
+}
+
+/// /livez — просто «жив ли процесс»
+pub async fn livez() -> &'static str { "ok" }
+
+/// /readyz — готовность: sled открыт; archive (если настроен) доступен; payout-адаптер сконфигурирован
+pub async fn readyz(State(st):State<Arc<AppState>>) -> (StatusCode, Json<Ready>) {
+    // sled: быстрая эвристика — БД поднялась и восстановилась
+    let db_ok = st.sled().was_recovered();
+    // archive: настроен ли (при желании можно сделать query .get().await)
+    let arch_ok = st.archive.is_some();
+    // payout-конфиг
+    let payout_ok = std::env::var("BRIDGE_PAYOUT_URL").is_ok() && std::env::var("LRB_BRIDGE_KEY").is_ok();
+
+    let body = Ready{ db: db_ok, archive: arch_ok, payout_cfg: payout_ok };
+    let status = if db_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (status, Json(body))
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/lib.rs ===
+
+```rust
+//! LOGOS node library crate — корневые модули и реэкспорты
+
+pub mod api;
+pub mod admin;
+pub mod archive;
+pub mod auth;
+pub mod bridge;
+pub mod bridge_journal;      // ← добавили модуль журнала моста
+pub mod gossip;
+pub mod guard;
+pub mod metrics;
+pub mod openapi;
+pub mod peers;
+pub mod producer;
+pub mod state;
+pub mod stake;
+pub mod storage;
+pub mod version;
+pub mod wallet;
+
+// точечные реэкспорты (по мере надобности)
+pub use metrics::prometheus as metrics_prometheus;
+pub use version::get as version_get;
+
+```
+
+
+=== /root/logos_lrb/node/src/main.rs ===
+
+```rust
+use axum::{routing::{get, post}, Router};
+use tower::ServiceBuilder;
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use std::sync::Arc;
+use tracing::{info, warn};
+
+mod api;
+mod bridge;
+mod bridge_journal;
+mod payout_adapter;   // адаптер выплат (используется в bridge)
+mod admin;
+mod gossip;
+mod state;
+mod peers;
+mod guard;
+mod metrics;
+mod version;
+mod storage;
+mod archive;
+mod openapi;
+mod auth;
+mod stake;
+mod stake_claim;      // реальный claim_settle (зачисление в ledger)
+mod health;           // /livez + /readyz
+mod wallet;
+mod producer;
+
+fn router(app_state: Arc<state::AppState>) -> Router {
+    Router::new()
+        // --- public ---
+        .route("/healthz", get(api::healthz))
+        .route("/livez",  get(health::livez))       // liveness
+        .route("/readyz", get(health::readyz))      // readiness
+        .route("/head",    get(api::head))
+        .route("/balance/:rid", get(api::balance))
+        .route("/submit_tx",       post(api::submit_tx))
+        .route("/submit_tx_batch", post(api::submit_tx_batch))
+        .route("/economy",         get(api::economy))
+        .route("/history/:rid",    get(api::history))
+
+        // --- archive API (PG) ---
+        .route("/archive/blocks",      get(api::archive_blocks))
+        .route("/archive/txs",         get(api::archive_txs))
+        .route("/archive/history/:rid",get(api::archive_history))
+        .route("/archive/tx/:txid",    get(api::archive_tx))
+
+        // --- staking wrappers (совместимость с фронтом) ---
+        .route("/stake/delegate",   post(api::stake_delegate))
+        .route("/stake/undelegate", post(api::stake_undelegate))
+        .route("/stake/claim",      post(api::stake_claim))
+        .route("/stake/my/:rid",    get(api::stake_my))
+        // реальный settle награды в ledger
+        .route("/stake/claim_settle", post(stake_claim::claim_settle))
+
+        // --- bridge (durable + payout, Send-safe) ---
+        // JSON endpoints для mTLS+HMAC периметра (Nginx rewrites → сюда)
+        .route("/bridge/deposit_json", post(bridge::deposit_json))
+        .route("/bridge/redeem_json",  post(bridge::redeem_json))
+        // Оставляем и «обычные» (внутренние) эндпоинты через безопасные замыкания
+        .route(
+            "/bridge/deposit",
+            post(|st: axum::extract::State<Arc<state::AppState>>,
+                  body: axum::Json<bridge::DepositReq>| async move {
+                bridge::deposit(st, body).await
+            })
+        )
+        .route(
+            "/bridge/redeem",
+            post(|st: axum::extract::State<Arc<state::AppState>>,
+                  body: axum::Json<bridge::RedeemReq>| async move {
+                bridge::redeem(st, body).await
+            })
+        )
+        .route("/health/bridge",  get(bridge::health))
+
+        // --- version / metrics / openapi ---
+        .route("/version",     get(version::get))
+        .route("/metrics",     get(metrics::prometheus))
+        .route("/openapi.json",get(openapi::serve))
+
+        // --- admin ---
+        .route("/admin/set_balance", post(admin::set_balance))
+        .route("/admin/bump_nonce",  post(admin::bump_nonce))
+        .route("/admin/set_nonce",   post(admin::set_nonce))
+        .route("/admin/mint",        post(admin::mint))
+        .route("/admin/burn",        post(admin::burn))
+
+        // --- legacy (если используются) ---
+        .merge(wallet::routes())
+        .merge(stake::routes())
+
+        // --- layers/state ---
+        .with_state(app_state)
+        .layer(
+            ServiceBuilder::new()
+                .layer(TraceLayer::new_for_http())
+                .layer(axum::middleware::from_fn(guard::rate_limit_mw))
+                .layer(axum::middleware::from_fn(metrics::track))
+        )
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // logging
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,hyper=warn")))
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    // secrets/keys
+    auth::assert_secrets_on_start().expect("secrets missing");
+
+    // state
+    let app_state = Arc::new(state::AppState::new()?);
+
+    // optional archive
+    if let Some(ar) = crate::archive::Archive::new_from_env().await {
+        unsafe {
+            let p = Arc::as_ptr(&app_state) as *mut state::AppState;
+            (*p).archive = Some(ar);
+        }
+        info!("archive backend initialized");
+    } else {
+        warn!("archive disabled");
+    }
+
+    // producer
+    info!("producer start");
+    let _producer = producer::run(app_state.clone());
+
+    // bridge retry worker
+    tokio::spawn(bridge::retry_worker(app_state.clone()));
+
+    // bind & serve
+    let addr = state::bind_addr();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!("logos_node listening on {addr}");
+    axum::serve(listener, router(app_state)).await?;
+    Ok(())
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/metrics.rs ===
+
+```rust
+use axum::{
+    body::Body,
+    http::Request,
+    middleware::Next,
+    response::IntoResponse,
+    http::StatusCode,
+};
+use once_cell::sync::Lazy;
+use prometheus::{
+    Encoder, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry, TextEncoder,
+    register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
+};
+use std::time::Instant;
+
+pub static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
+
+// ---- HTTP ----
+static HTTP_REQS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!("logos_http_requests_total","HTTP reqs",&["method","path","status"]).unwrap()
+});
+static HTTP_LAT: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!("logos_http_duration_seconds","HTTP latency",&["method","path","status"],
+        prometheus::exponential_buckets(0.001,2.0,14).unwrap()).unwrap()
+});
+
+// ---- Chain ----
+static BLOCKS_TOTAL: Lazy<IntCounter> = Lazy::new(|| register_int_counter!("logos_blocks_produced_total","Blocks total").unwrap());
+static HEAD_HEIGHT: Lazy<IntGauge>    = Lazy::new(|| register_int_gauge!("logos_head_height","Head").unwrap());
+static FINAL_HEIGHT: Lazy<IntGauge>   = Lazy::new(|| register_int_gauge!("logos_finalized_height","Finalized").unwrap());
+
+// ---- Tx ----
+static TX_ACCEPTED: Lazy<IntCounter> = Lazy::new(|| register_int_counter!("logos_tx_accepted_total","Accepted tx").unwrap());
+static TX_REJECTED: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!("logos_tx_rejected_total","Rejected tx",&["reason"]).unwrap()
+});
+
+// ---- Bridge (durable) ----
+static BRIDGE_OPS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!("logos_bridge_ops_total","Bridge ops",&["kind","status"]).unwrap()
+});
+
+// ---- Archive backpressure ----
+static ARCHIVE_QUEUE: Lazy<IntGauge> = Lazy::new(|| register_int_gauge!("logos_archive_queue","Archive queue depth").unwrap());
+
+fn norm(p:&str)->String{
+    if p.starts_with("/balance/") {"/balance/:rid".into()}
+    else if p.starts_with("/history/"){"/history/:rid".into()}
+    else if p.starts_with("/stake/my/"){"/stake/my/:rid".into()}
+    else {p.to_string()}
+}
+
+pub async fn track(req: Request<Body>, next: Next) -> axum::response::Response {
+    let m=req.method().as_str().to_owned();
+    let p=norm(req.uri().path());
+    let t=Instant::now();
+    let res=next.run(req).await;
+    let s=res.status().as_u16().to_string();
+    HTTP_REQS.with_label_values(&[&m,&p,&s]).inc();
+    HTTP_LAT.with_label_values(&[&m,&p,&s]).observe(t.elapsed().as_secs_f64());
+    res
+}
+
+pub async fn prometheus()->impl IntoResponse{
+    let mfs=REGISTRY.gather();
+    let mut buf=Vec::new();
+    let enc=TextEncoder::new();
+    if let Err(_)=enc.encode(&mfs,&mut buf){ return (StatusCode::INTERNAL_SERVER_ERROR,"encode error").into_response(); }
+    match String::from_utf8(buf){
+        Ok(body)=>(StatusCode::OK,body).into_response(),
+        Err(_)=>(StatusCode::INTERNAL_SERVER_ERROR,"utf8 error").into_response(),
+    }
+}
+
+// API для модулей
+pub fn inc_block_produced(){ BLOCKS_TOTAL.inc(); }
+pub fn set_chain(h:u64, f:u64){ HEAD_HEIGHT.set(h as i64); FINAL_HEIGHT.set(f as i64); }
+pub fn inc_tx_accepted(){ TX_ACCEPTED.inc(); }
+pub fn inc_tx_rejected(reason:&'static str){ TX_REJECTED.with_label_values(&[reason]).inc(); }
+pub fn inc_bridge(kind:&'static str, status:&'static str){ BRIDGE_OPS.with_label_values(&[kind,status]).inc(); }
+pub fn set_archive_queue(n:i64){ ARCHIVE_QUEUE.set(n); }
+
+// Совместимость со старым кодом
+#[allow(dead_code)] pub fn inc_total(_label:&str){}
+
+```
+
+
+=== /root/logos_lrb/node/src/openapi.rs ===
+
+```rust
+use axum::response::{IntoResponse, Response};
+use axum::http::{HeaderValue, StatusCode};
+
+static SPEC: &str = include_str!("../openapi/openapi.json");
+
+pub async fn serve() -> Response {
+    let mut resp = (StatusCode::OK, SPEC).into_response();
+    let headers = resp.headers_mut();
+    let _ = headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    resp
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/payout_adapter.rs ===
+
+```rust
+//! External payout adapter for rToken redeem (HTTP).
+//! ENV:
+//!   BRIDGE_PAYOUT_URL   — базовый URL payout-сервиса (https://bridge.example.com)
+//!   BRIDGE_PAYOUT_PATH  — относительный путь (по умолчанию: /api/payout)
+//!   LRB_BRIDGE_KEY      CHANGE_ME общий секрет (заголовок X-Bridge-Key)
+
+use anyhow::{Result,anyhow};
+use reqwest::Client;
+use serde::Serialize;
+
+#[derive(Clone)]
+pub struct PayoutAdapter{
+    base: String,
+    path: String,
+    key:  String,
+    http: Client,
+}
+
+#[derive(Serialize)]
+struct PayoutReq<'a>{
+    rid:    &'a str,
+    amount: u64,
+    ext_txid: &'a str,
+}
+
+impl PayoutAdapter{
+    pub fn from_env() -> Result<Self>{
+        let base = std::env::var("BRIDGE_PAYOUT_URL")
+            .map_err(|_| anyhow!("BRIDGE_PAYOUT_URL not set"))?;
+        let path = std::env::var("BRIDGE_PAYOUT_PATH").unwrap_or_else(|_| "/api/payout".to_string());
+        let key  = std::env::var("LRB_BRIDGE_KEY")
+            .map_err(|_| anyhow!("LRB_BRIDGE_KEY CHANGE_ME set"))?;
+        Ok(Self{ base, path, key, http: Client::new() })
+    }
+
+    #[inline]
+    fn url(&self)->String { format!("{}{}", self.base.trim_end_matches('/'), self.path) }
+
+    pub async fn send_payout(&self, rid:&str, amount:u64, ext_txid:&str) -> Result<()>{
+        let body = PayoutReq{ rid, amount, ext_txid };
+        let resp = self.http.post(self.url())
+            .header("X-Bridge-Key", &self.key)
+            .json(&body)
+            .send().await?;
+
+        let status = resp.status();
+        let text   = resp.text().await.unwrap_or_default();
+
+        if !status.is_success(){
+            return Err(anyhow!("payout_http_{}: {}", status.as_u16(), text));
+        }
+        Ok(())
+    }
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/peers.rs ===
+
+```rust
+#![allow(dead_code)]
+#![allow(dead_code)]
+use std::time::{SystemTime, UNIX_EPOCH};
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u128)
+        .unwrap_or(0)
+}
+
+use once_cell::sync::Lazy;
+use prometheus::{register_int_gauge, IntGauge};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+static QUARANTINED_GAUGE: Lazy<IntGauge> =
+    Lazy::new(|| register_int_gauge!("peers_quarantined", "quarantined peers").unwrap());
+static PEERS_TOTAL_GAUGE: Lazy<IntGauge> =
+    Lazy::new(|| register_int_gauge!("peers_total", "known peers").unwrap());
+
+#[derive(Clone, Debug)]
+pub struct PeerScore {
+    pub last_seen_ms: u128,
+    pub score_milli: i64,
+    pub fails: u32,
+    pub dups: u32,
+    pub banned_until_ms: u128,
+}
+impl Default for PeerScore {
+    fn default() -> Self {
+        Self {
+            last_seen_ms: now_ms(),
+            score_milli: 0,
+            fails: 0,
+            dups: 0,
+            banned_until_ms: 0,
+        }
+    }
+}
+
+/// Резонансные параметры скоринга
+#[derive(Clone)]
+pub struct PeerPolicy {
+    pub ban_ttl_ms: u128,
+    pub decay_ms: u128,
+    pub up_tick: i64,
+    pub dup_penalty: i64,
+    pub invalid_penalty: i64,
+    pub ban_threshold_milli: i64,
+    pub unban_threshold_milli: i64,
+}
+impl Default for PeerPolicy {
+    fn default() -> Self {
+        Self {
+            ban_ttl_ms: 60_000,    // 60s карантин
+            decay_ms: 10_000,      // каждые 10s подплытие к 0
+            up_tick: 150,          // успешный блок/голос +0.150
+            dup_penalty: -50,      // дубликат −0.050
+            invalid_penalty: -500, // невалидное сообщение −0.500
+            ban_threshold_milli: -1500,
+            unban_threshold_milli: -300,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct PeerBook {
+    inner: Arc<Mutex<HashMap<String, PeerScore>>>, // pk_b58 -> score
+    policy: PeerPolicy,
+}
+impl PeerBook {
+    pub fn new(policy: PeerPolicy) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            policy,
+        }
+    }
+    fn entry_mut(&self, _pk: &str) -> std::sync::MutexGuard<'_, HashMap<String, PeerScore>> {
+        self.inner.lock().unwrap()
+    }
+
+    pub fn on_success(&self, pk: &str) {
+        let mut m = self.entry_mut(pk);
+        let s = m.entry(pk.to_string()).or_default();
+        s.last_seen_ms = now_ms();
+        s.score_milli += self.policy.up_tick;
+        if s.score_milli > 5000 {
+            s.score_milli = 5000;
+        }
+    }
+    pub fn on_duplicate(&self, pk: &str) {
+        let mut m = self.entry_mut(pk);
+        let s = m.entry(pk.to_string()).or_default();
+        s.dups += 1;
+        s.score_milli += self.policy.dup_penalty;
+        if s.score_milli < self.policy.ban_threshold_milli {
+            s.banned_until_ms = now_ms() + self.policy.ban_ttl_ms;
+        }
+    }
+    pub fn on_invalid(&self, pk: &str) {
+        let mut m = self.entry_mut(pk);
+        let s = m.entry(pk.to_string()).or_default();
+        s.fails += 1;
+        s.score_milli += self.policy.invalid_penalty;
+        s.banned_until_ms = now_ms() + self.policy.ban_ttl_ms;
+    }
+    pub fn is_quarantined(&self, pk: &str) -> bool {
+        let m = self.inner.lock().unwrap();
+        m.get(pk)
+            .map(|s| now_ms() < s.banned_until_ms)
+            .unwrap_or(false)
+    }
+    pub fn tick(&self) {
+        let mut m = self.inner.lock().unwrap();
+        let now = now_ms();
+        let mut banned = 0;
+        for (_k, s) in m.iter_mut() {
+            // decay к 0
+            if s.score_milli < 0 {
+                let dt = (now.saturating_sub(s.last_seen_ms)) as i128;
+                if dt > 0 {
+                    let steps = (dt as f64 / self.policy.decay_ms as f64).floor() as i64;
+                    if steps > 0 {
+                        s.score_milli += steps * 50; // +0.050/шаг
+                        if s.score_milli > 0 {
+                            s.score_milli = 0;
+                        }
+                        s.last_seen_ms = now;
+                    }
+                }
+            }
+            // снять бан, если вышли из «красной зоны»
+            if s.banned_until_ms > 0
+                && now >= s.banned_until_ms
+                && s.score_milli > self.policy.unban_threshold_milli
+            {
+                s.banned_until_ms = 0;
+            }
+            if s.banned_until_ms > now {
+                banned += 1;
+            }
+        }
+        QUARANTINED_GAUGE.set(banned);
+        PEERS_TOTAL_GAUGE.set(m.len() as i64);
+    }
+}
+pub fn spawn_peer_aging(book: PeerBook) {
+    tokio::spawn(async move {
+        let mut t = tokio::time::interval(Duration::from_millis(2000));
+        loop {
+            t.tick().await;
+            book.tick();
+        }
+    });
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/stake_claim.rs ===
+
+```rust
+use axum::{extract::State, http::StatusCode, Json};
+use serde::Deserialize;
+use std::sync::Arc;
+use crate::state::AppState;
+
+#[derive(Deserialize)]
+pub struct ClaimReq { pub rid:String, pub amount:u64 }
+
+/// Финализация награды: зачисляем в ledger (при необходимости добавь запись в историю)
+pub async fn claim_settle(State(st):State<Arc<AppState>>, Json(req):Json<ClaimReq>) -> (StatusCode,String){
+    {
+        let l = st.ledger.lock();
+        let bal = l.get_balance(&req.rid).unwrap_or(0);
+        let newb = bal.saturating_add(req.amount);
+        if let Err(e) = l.set_balance(&req.rid, newb as u128) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("{{\"error\":\"{e}\"}}"));
+        }
+        // Если хочешь — вставь спец-tx «reward» в историю (StoredTx).
+    }
+    (StatusCode::OK, "{\"ok\":true}".into())
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/state.rs ===
+
+```rust
+use std::sync::Arc;
+use parking_lot::Mutex;
+use anyhow::Result;
+
+pub struct AppState {
+    pub ledger: Arc<Mutex<lrb_core::ledger::Ledger>>,
+    pub archive: Option<crate::archive::Archive>,
+}
+
+impl AppState {
+    pub fn new() -> Result<Self> {
+        let path = std::env::var("LRB_DATA_PATH").unwrap_or_else(|_| "/var/lib/logos/data.sled".to_string());
+        let ledger = lrb_core::ledger::Ledger::open(&path)?;
+        // Archive: инициализируем позже в async, чтобы не блокировать startup
+        Ok(Self { ledger: Arc::new(Mutex::new(ledger)), archive: None })
+    }
+}
+
+pub fn bind_addr() -> std::net::SocketAddr {
+    let s = std::env::var("LRB_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    s.parse().expect("LRB_BIND must be host:port")
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/storage.rs ===
+
+```rust
+use serde::{Deserialize, Serialize};
+
+/// Вход транзакции — соответствуем полям, которые ожидает api.rs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxIn {
+    pub from: String,      // RID отправителя
+    pub to: String,        // RID получателя
+    pub amount: u64,       // количество
+    pub nonce: u64,        // обязательный
+    pub memo: Option<String>,
+    pub sig_hex: String,   // подпись в hex
+}
+
+/// Элемент истории для /history/:rid
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryItem {
+    pub txid: String,
+    pub height: u64,
+    pub from: String,
+    pub to: String,
+    pub amount: u64,
+    pub nonce: u64,
+    pub ts: Option<u64>,
+}
+
+/// Состояние аккаунта (минимум, который использует api.rs)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AccountState {
+    pub balance: u64,
+    pub nonce: u64,
+}
+
+```
+
+
+=== /root/logos_lrb/node/src/version.rs ===
+
+```rust
+use axum::{response::IntoResponse, Json};
+use serde::Serialize;
+
+include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
+
+#[derive(Serialize)]
+struct Version {
+    version: &'static str,
+    git_hash: &'static str,
+    git_branch: &'static str,
+    built_at: &'static str,
+}
+
+pub async fn get() -> impl IntoResponse {
+    Json(Version {
+        version: BUILD_PKG_VERSION,
+        git_hash: BUILD_GIT_HASH,
+        git_branch: BUILD_GIT_BRANCH,
+        built_at: BUILD_TIMESTAMP_RFC3339,
+    })
+}
+
+```
+
+
+---
+
+# 6. Web Wallet
+
+
+
+=== /root/logos_lrb/www/wallet/app.html ===
+
+```html
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LOGOS Wallet — Кошелёк</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0b0c10;color:#e6edf3}
+    header{padding:16px 20px;background:#11151a;border-bottom:1px solid #1e242c;position:sticky;top:0}
+    h1{font-size:18px;margin:0}
+    main{max-width:1024px;margin:24px auto;padding:0 16px}
+    section{background:#11151a;margin:16px 0;border-radius:12px;padding:16px;border:1px solid #1e242c}
+    label{display:block;margin:8px 0 6px}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    @media (max-width:900px){.grid{grid-template-columns:1fr}}
+    input,button,textarea{width:100%;padding:10px;border-radius:10px;border:1px solid #2a313a;background:#0b0f14;color:#e6edf3}
+    button{cursor:pointer;border:1px solid #3b7ddd;background:#1665c1}
+    button.secondary{background:#1b2129}
+    .mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+    small{opacity:.8}
+  </style>
+</head>
+<body>
+<header>
+  <h1>LOGOS Wallet — Кошелёк</h1>
+</header>
+<main>
+  <section>
+    <div class="grid">
+      <div>
+        <h3>Твой RID / Публичный ключ</h3>
+        <textarea id="pub" class="mono" rows="4" readonly></textarea>
+        <div style="display:flex;gap:10px;margin-top:10px">
+          <button id="btn-lock" class="secondary">Выйти (заблокировать)</button>
+          <button id="btn-nonce" class="secondary">Получить nonce</button>
+        </div>
+        <p><small>Ключ в памяти. Закроешь вкладку — понадобится пароль на странице входа.</small></p>
+      </div>
+      <div>
+        <h3>Баланс</h3>
+        <div class="grid">
+          <div><label>RID</label><input id="rid-balance" class="mono" placeholder="RID (base58)"/></div>
+          <div><label>&nbsp;</label><button id="btn-balance">Показать баланс</button></div>
+        </div>
+        <pre id="out-balance" class="mono" style="margin-top:12px"></pre>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h3>Подпись и отправка (batch)</h3>
+    <div class="grid">
+      <div><label>Получатель (RID)</label><input id="to" class="mono" placeholder="RID получателя"/></div>
+      <div><label>Сумма (LGN)</label><input id="amount" type="number" min="1" step="1" value="1"/></div>
+    </div>
+    <div class="grid">
+      <div><label>Nonce</label><input id="nonce" type="number" min="1" step="1" placeholder="нажми 'Получить nonce'"/></div>
+      <div><label>&nbsp;</label><button id="btn-send">Подписать и отправить</button></div>
+    </div>
+    <pre id="out-send" class="mono" style="margin-top:12px"></pre>
+  </section>
+
+  <section>
+    <h3>Мост rToken (депозит, демо)</h3>
+    <div class="grid">
+      <div><label>ext_txid</label><input id="ext" class="mono" placeholder="например eth_txid_0xabc"/></div>
+      <div><label>&nbsp;</label><button id="btn-deposit">Deposit rLGN</button></div>
+    </div>
+    <pre id="out-bridge" class="mono" style="margin-top:12px"></pre>
+  </section>
+</main>
+<script src="./app.js?v=20250906_01" defer></script>
+</body>
+</html>
+
+```
+
+
+=== /root/logos_lrb/www/wallet/app.js ===
+
+```javascript
+// APP: ключи в памяти; RID неизменен — берём из sessionStorage, meta из acct:<RID>
+const API = location.origin + '/api';
+const DB_NAME='logos_wallet_v2', STORE='keys', enc=new TextEncoder();
+const ALPH="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+const $=s=>document.querySelector(s);
+const toHex=b=>[...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('');
+const fromHex=h=>new Uint8Array(h.match(/.{1,2}/g).map(x=>parseInt(x,16)));
+const b58=bytes=>{const h=[...new Uint8Array(bytes)].map(b=>b.toString(16).padStart(2,'0')).join('');let x=BigInt('0x'+h),o='';while(x>0n){o=ALPH[Number(x%58n)]+o;x/=58n;}return o||'1';};
+
+const idb=()=>new Promise((res,rej)=>{const r=indexedDB.open(DB_NAME,1);r.onupgradeneeded=()=>r.result.createObjectStore(STORE);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});
+const idbGet=async k=>{const db=await idb();return new Promise((res,rej)=>{const t=db.transaction(STORE,'readonly').objectStore(STORE).get(k);t.onsuccess=()=>res(t.result||null);t.onerror=()=>rej(t.error);});};
+
+async function deriveKey(pass,salt){const keyMat=await crypto.subtle.importKey('raw',new TextEncoder().encode(pass),'PBKDF2',false,['deriveKey']);return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:120000,hash:'SHA-256'},keyMat,{name:'AES-GCM',length:256},false,['decrypt']);}
+async function aesDecrypt(aesKey,iv,ct){return new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:new Uint8Array(iv)},aesKey,new Uint8Array(ct)))}
+async function importKey(pass, meta){
+  const aes=await deriveKey(pass,new Uint8Array(meta.salt));
+  const pkcs8=await aesDecrypt(aes,meta.iv,meta.priv);
+  const privateKey=await crypto.subtle.importKey('pkcs8',pkcs8,{name:'Ed25519'},true,['sign']);
+  const publicKey =await crypto.subtle.importKey('raw',new Uint8Array(meta.pub),{name:'Ed25519'},true,['verify']);
+  return {privateKey, publicKey};
+}
+
+// Session guard
+const PASS=sessionStorage.getItem('logos_pass');
+const RID =sessionStorage.getItem('logos_rid');
+if(!PASS || !RID){ location.replace('./login.html'); throw new Error('locked'); }
+
+let KEYS=null, META=null;
+
+(async ()=>{
+  META=await idbGet('acct:'+RID);
+  if(!META){ sessionStorage.clear(); location.replace('./login.html'); return; }
+  KEYS=await importKey(PASS,META);
+  document.getElementById('pub').value=`RID: ${RID}\nPUB (hex): ${toHex(new Uint8Array(META.pub))}`;
+  document.getElementById('rid-balance').value=RID;
+})();
+
+document.getElementById('btn-lock').addEventListener('click', ()=>{ sessionStorage.clear(); location.replace('./login.html'); });
+
+// API helpers
+async function getJSON(url, body){
+  const r = await fetch(url, body ? {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)} : {});
+  if(!r.ok){ throw new Error(`${r.status} ${await r.text()}`); }
+  return r.json();
+}
+async function getNonce(rid){ const j=await getJSON(`${API}/balance/${rid}`); return j.nonce||0; }
+async function canonHex(from,to,amount,nonce){
+  const r=await fetch(`${API}/debug_canon`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tx:{from,to,amount:Number(amount),nonce:Number(nonce)}})});
+  if(!r.ok){ throw new Error(`/debug_canon ${r.status}`); }
+  return (await r.json()).canon_hex;
+}
+async function submitBatch(txs){
+  const r=await fetch(`${API}/submit_tx_batch`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({txs})});
+  if(!r.ok){ throw new Error(`/submit_tx_batch ${r.status}`); }
+  return r.json();
+}
+async function deposit(rid, amount, ext){
+  const r=await fetch(`${API}/bridge/deposit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rid,amount:Number(amount),ext_txid:ext})});
+  return {status:r.status, text:await r.text()};
+}
+async function signCanon(privateKey, canonHex){
+  const msg=fromHex(canonHex);
+  const sig=await crypto.subtle.sign('Ed25519', privateKey, msg);
+  return [...new Uint8Array(sig)].map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+
+// Buttons
+document.getElementById('btn-nonce').addEventListener('click', async ()=>{
+  try{ const n=await getNonce(RID); document.getElementById('nonce').value=String(n+1); }
+  catch(e){ alert('ERR '+e); }
+});
+
+document.getElementById('btn-balance').addEventListener('click', async ()=>{
+  try{ const rid=document.getElementById('rid-balance').value.trim(); const j=await getJSON(`${API}/balance/${rid}`); document.getElementById('out-balance').textContent=JSON.stringify(j,null,2); }
+  catch(e){ document.getElementById('out-balance').textContent=String(e); }
+});
+
+document.getElementById('btn-send').addEventListener('click', async ()=>{
+  const to=document.getElementById('to').value.trim();
+  const amount=document.getElementById('amount').value;
+  const nonce=document.getElementById('nonce').value;
+  const out=document.getElementById('out-send');
+  try{
+    const ch = await canonHex(RID,to,amount,nonce);
+    const sig= await signCanon(KEYS.privateKey,ch);
+    const res= await submitBatch([{from:RID,to,amount:Number(amount),nonce:Number(nonce),sig_hex:sig}]);
+    out.textContent=JSON.stringify(res,null,2);
+  }catch(e){ out.textContent=String(e); }
+});
+
+document.getElementById('btn-deposit').addEventListener('click', async ()=>{
+  const ext=document.getElementById('ext').value.trim()||'eth_txid_demo';
+  const r=await deposit(RID,123,ext);
+  document.getElementById('out-bridge').textContent=`HTTP ${r.status}\n${r.text}`;
+});
+
+```
+
+
+=== /root/logos_lrb/www/wallet/auth.js ===
+
+```javascript
+// AUTH v3: RID + пароль. Сохраняем под "acct:<RID>".
+// Фичи: авто-подстановка last_rid, кликабельный список, чистка всех пробелов/переносов в RID.
+
+const DB_NAME='logos_wallet_v2', STORE='keys', enc=new TextEncoder();
+const $ = s => document.querySelector(s);
+const out = msg => { const el=$('#out'); if(el) el.textContent=String(msg); };
+
+function normRid(s){ return (s||'').replace(/\s+/g,'').trim(); } // убираем все пробелы/переносы
+
+function ensureEnv() {
+  if (!window.isSecureContext) throw new Error('Нужен HTTPS (secure context)');
+  if (!window.indexedDB) throw new Error('IndexedDB недоступен');
+  if (!crypto || !crypto.subtle) throw new Error('WebCrypto недоступен');
+}
+
+const idb=()=>new Promise((res,rej)=>{const r=indexedDB.open(DB_NAME,1);r.onupgradeneeded=()=>r.result.createObjectStore(STORE);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});
+const idbGet=async k=>{const db=await idb();return new Promise((res,rej)=>{const t=db.transaction(STORE,'readonly').objectStore(STORE).get(k);t.onsuccess=()=>res(t.result||null);t.onerror=()=>rej(t.error);});};
+const idbSet=async (k,v)=>{const db=await idb();return new Promise((res,rej)=>{const t=db.transaction(STORE,'readwrite').objectStore(STORE).put(v,k);t.onsuccess=()=>res(true);t.onerror=()=>rej(t.error);});};
+const idbDel=async k=>{const db=await idb();return new Promise((res,rej)=>{const t=db.transaction(STORE,'readwrite').objectStore(STORE).delete(k);t.onsuccess=()=>res(true);t.onerror=()=>rej(t.error);});};
+
+async function deriveKey(pass,salt){
+  const keyMat=await crypto.subtle.importKey('raw',enc.encode(pass),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:120000,hash:'SHA-256'},keyMat,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+async function aesEncrypt(aesKey,data){const iv=crypto.getRandomValues(new Uint8Array(12));const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},aesKey,data);return{iv:Array.from(iv),ct:Array.from(new Uint8Array(ct))}}
+async function aesDecrypt(aesKey,iv,ct){return new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:new Uint8Array(iv)},aesKey,new Uint8Array(ct)))}
+
+function b58(bytes){
+  const ALPH="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  const hex=[...new Uint8Array(bytes)].map(b=>b.toString(16).padStart(2,'0')).join('');
+  let x=BigInt('0x'+hex), out=''; while(x>0n){ out=ALPH[Number(x%58n)]+out; x/=58n; } return out||'1';
+}
+
+async function addAccount(rid){ const list=(await idbGet('accounts'))||[]; if(!list.includes(rid)){ list.push(rid); await idbSet('accounts',list); } }
+async function listAccounts(){ return (await idbGet('accounts'))||[]; }
+
+async function createAccount(pass){
+  ensureEnv();
+  if(!pass || pass.length<6) throw new Error('Пароль ≥6 символов');
+
+  out('Создаём ключ…');
+  const kp=await crypto.subtle.generateKey({name:'Ed25519'},true,['sign','verify']);
+  const rawPub=new Uint8Array(await crypto.subtle.exportKey('raw',kp.publicKey));
+  const rid=b58(rawPub);
+  const pkcs8=new Uint8Array(await crypto.subtle.exportKey('pkcs8',kp.privateKey));
+  const salt=crypto.getRandomValues(new Uint8Array(16));
+  const aes=await deriveKey(pass,salt);
+  const {iv,ct}=await aesEncrypt(aes,pkcs8);
+  const meta={rid,pub:Array.from(rawPub),salt:Array.from(salt),iv,priv:ct};
+
+  await idbSet('acct:'+rid,meta);
+  await addAccount(rid);
+  await idbSet('last_rid', rid);
+
+  sessionStorage.setItem('logos_pass',pass);
+  sessionStorage.setItem('logos_rid',rid);
+  out('RID создан: '+rid+' → вход…');
+  location.href='./app.html';
+}
+
+async function loginAccount(rid, pass){
+  ensureEnv();
+  rid = normRid(rid);
+  if(!rid) throw new Error('Укажи RID');
+  if(!pass || pass.length<6) throw new Error('Пароль ≥6 символов');
+
+  const meta=await idbGet('acct:'+rid);
+  if(!meta){
+    const list=await listAccounts();
+    throw new Error('RID не найден на этом устройстве. Сохранённые RID:\n'+(list.length?list.join('\n'):'—'));
+  }
+  const aes=await deriveKey(pass,new Uint8Array(meta.salt));
+  try{ await aesDecrypt(aes,meta.iv,meta.priv); } catch(e){ throw new Error('Неверный пароль'); }
+
+  sessionStorage.setItem('logos_pass',pass);
+  sessionStorage.setItem('logos_rid',rid);
+  await idbSet('last_rid', rid);
+  out('Вход…'); location.href='./app.html';
+}
+
+async function resetAll(){
+  const list=await listAccounts();
+  for(const rid of list){ await idbDel('acct:'+rid); }
+  await idbDel('accounts'); await idbDel('last_rid');
+  sessionStorage.clear();
+  out('Все аккаунты удалены (DEV).');
+}
+
+function renderRidList(list){
+  const wrap=$('#listWrap'), ul=$('#ridList'); ul.innerHTML='';
+  if(!list.length){ wrap.style.display='block'; ul.innerHTML='<li>— пусто —</li>'; return; }
+  wrap.style.display='block';
+  list.forEach(rid=>{
+    const li=document.createElement('li'); li.textContent=rid;
+    li.addEventListener('click', ()=>{ $('#loginRid').value=rid; out('RID подставлен'); });
+    ul.appendChild(li);
+  });
+}
+
+// авто-подстановка last_rid при загрузке
+(async ()=>{
+  const last=await idbGet('last_rid'); if(last){ $('#loginRid').value=last; }
+})();
+
+// wire UI
+$('#btn-login').addEventListener('click', async ()=>{
+  const rid=$('#loginRid').value; const pass=$('#pass').value;
+  try{ await loginAccount(rid,pass); }catch(e){ out('ERR: '+(e&&e.message?e.message:e)); }
+});
+$('#btn-create').addEventListener('click', async ()=>{
+  const pass=$('#pass').value;
+  try{ await createAccount(pass); }catch(e){ out('ERR: '+(e&&e.message?e.message:e)); }
+});
+$('#btn-list').addEventListener('click', async ()=>{
+  try{ renderRidList(await listAccounts()); }catch(e){ out('ERR: '+e); }
+});
+$('#btn-reset').addEventListener('click', resetAll);
+
+```
+
+
+=== /root/logos_lrb/www/wallet/index.html ===
+
+```html
+<!doctype html><meta charset="utf-8">
+<title>Redirecting…</title>
+<meta http-equiv="refresh" content="0; url=./login.html">
+<a href="./login.html">Перейти в LOGOS Wallet</a>
+
+```
+
+
+=== /root/logos_lrb/www/wallet/login.html ===
+
+```html
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LOGOS Wallet — Вход</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0b0c10;color:#e6edf3}
+    header{padding:16px 20px;background:#11151a;border-bottom:1px solid #1e242c}
+    h1{font-size:18px;margin:0}
+    main{max-width:720px;margin:48px auto;padding:0 16px}
+    section{background:#11151a;margin:16px 0;border-radius:12px;padding:16px;border:1px solid #1e242c}
+    label{display:block;margin:8px 0 6px}
+    input,button{width:100%;padding:12px;border-radius:10px;border:1px solid #2a313a;background:#0b0f14;color:#e6edf3}
+    button{cursor:pointer;border:1px solid #3b7ddd;background:#1665c1}
+    button.secondary{background:#1b2129}
+    small{opacity:.8}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    @media (max-width:720px){.grid{grid-template-columns:1fr}}
+    .mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+    ul{list-style:none;padding:0;margin:8px 0}
+    li{padding:8px;border:1px solid #2a313a;border-radius:8px;margin-bottom:6px;cursor:pointer;background:#0b0f14}
+  </style>
+</head>
+<body>
+<header><h1>LOGOS Wallet — Secure (WebCrypto + IndexedDB)</h1></header>
+<main>
+  <section>
+    <h3>Вход в аккаунт</h3>
+    <label>Логин (RID)</label>
+    <input id="loginRid" class="mono" placeholder="Вставь RID (base58) или выбери из списка ниже"/>
+    <label>Пароль</label>
+    <input id="pass" type="password" placeholder="Пароль для шифрования ключа"/>
+
+    <div class="grid" style="margin-top:12px">
+      <button id="btn-login">Войти по RID + пароль</button>
+      <button id="btn-create">Создать новый RID</button>
+    </div>
+
+    <div style="margin-top:12px">
+      <button id="btn-list" class="secondary">Показать сохранённые RID</button>
+      <button id="btn-reset" class="secondary">Сбросить все аккаунты (DEV)</button>
+    </div>
+
+    <div id="listWrap" style="display:none;margin-top:10px">
+      <small>Сохранённые на этом устройстве RID (тапни, чтобы подставить):</small>
+      <ul id="ridList"></ul>
+    </div>
+
+    <p><small>Ключ Ed25519 хранится зашифрованным AES-GCM (PBKDF2) в IndexedDB. Ничего не уходит в сеть.</small></p>
+    <pre id="out" class="mono"></pre>
+  </section>
+</main>
+<script src="./auth.js?v=20250906_03" defer></script>
+</body>
+</html>
+
+```
+
+
+=== /root/logos_lrb/www/wallet/wallet.css ===
+
+```css
+:root {
+  --bg: #0e1116;
+  --fg: #e6edf3;
+  --muted: #9aa4ae;
+  --card: #161b22;
+  --border: #2d333b;
+  --accent: #2f81f7;
+  --accent-2: #7ee787;
+  --warn: #f0883e;
+  --error: #ff6b6b;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sans: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, sans-serif;
+}
+html[data-theme="light"] {
+  --bg: #f6f8fa;
+  --fg: #0b1117;
+  --muted: #57606a;
+  --card: #ffffff;
+  --border: #d0d7de;
+  --accent: #0969da;
+  --accent-2: #1a7f37;
+  --warn: #9a6700;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--sans); }
+a { color: var(--accent); text-decoration: none; }
+.topbar {
+  position: sticky; top: 0; z-index: 10;
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 14px; border-bottom: 1px solid var(--border); background: var(--card);
+}
+.brand { font-weight: 700; }
+.spacer { flex: 1; }
+.endpoint { font-size: 12px; color: var(--muted); }
+.container { max-width: 980px; margin: 16px auto; padding: 0 12px; display: grid; gap: 16px; }
+.card {
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--card); padding: 14px;
+}
+h2 { margin: 0 0 10px 0; font-size: 18px; }
+.row { display: flex; gap: 8px; align-items: center; }
+.wrap { flex-wrap: wrap; }
+.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
+.mt8 { margin-top: 8px; }
+.input {
+  border: 1px solid var(--border); background: transparent; color: var(--fg);
+  padding: 8px 10px; border-radius: 8px; outline: none;
+}
+.input:focus { border-color: var(--accent); }
+.grow { flex: 1; min-width: 260px; }
+.w100 { width: 100px; }
+.w120 { width: 120px; }
+.btn {
+  border: 1px solid var(--border); background: var(--accent); color: #fff;
+  padding: 8px 12px; border-radius: 8px; cursor: pointer;
+}
+.btn.secondary { background: transparent; color: var(--fg); }
+.btn.warn { background: var(--warn); color: #111; }
+.btn:disabled { opacity: .6; cursor: not-allowed; }
+.mono { font-family: var(--mono); }
+.log {
+  font-family: var(--mono); background: transparent; border: 1px dashed var(--border);
+  border-radius: 8px; padding: 8px; min-height: 40px; white-space: pre-wrap;
+}
+.statusbar {
+  position: sticky; bottom: 0; margin-top: 12px; padding: 8px 14px;
+  border-top: 1px solid var(--border); background: var(--card); color: var(--muted);
+}
+
+/* auto-theming для системной темы, если юзер не переключал вручную */
+@media (prefers-color-scheme: light) {
+  html[data-theme="auto"] { --bg: #f6f8fa; --fg: #0b1117; --muted:#57606a; --card:#fff; --border:#d0d7de; --accent:#0969da; --accent-2:#1a7f37; --warn:#9a6700; }
+}
+
+```
+
+
+---
+
+# 7. Explorer
+
+
+
+=== /root/logos_lrb/www/explorer/index.html ===
+
+```html
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta http-equiv="Cache-Control" content="no-store"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LOGOS Explorer — v2 (inline)</title>
+  <style>
+    :root{--bg:#0b0c10;--card:#11151a;--line:#1e242c;--muted:#9aa4af;--txt:#e6edf3;--btn:#1665c1;--btn-b:#3b7ddd;}
+    *{box-sizing:border-box}
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:var(--bg);color:var(--txt)}
+    header{padding:12px;background:var(--card);border-bottom:1px solid var(--line);display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    header h1{font-size:18px;margin:0}
+    #jsStat{font-size:12px;margin-left:auto}
+    main{max-width:1100px;margin:18px auto;padding:0 12px}
+    section{background:var(--card);margin:12px 0;border-radius:14px;padding:14px;border:1px solid var(--line)}
+    h3{margin:6px 0 12px 0}
+    .row{display:flex;gap:10px;flex-wrap:wrap}
+    .row>.grow{flex:1 1 360px}
+    .row>.fit{flex:0 0 140px}
+    input{width:100%;padding:10px;border-radius:10px;border:1px solid var(--line);background:#0b0f14;color:#e6edf3}
+    button{padding:10px 14px;border-radius:10px;border:1px solid var(--btn-b);background:var(--btn);color:#fff;font-weight:600;cursor:pointer}
+    .btns{display:flex;gap:8px;flex-wrap:wrap}
+    pre{white-space:pre-wrap;word-break:break-word;background:#0b0f14;border:1px solid var(--line);border-radius:10px;padding:10px;overflow:auto;margin:8px 0 0}
+    .cards{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    @media(max-width:900px){.cards{grid-template-columns:1fr}}
+    .table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;margin-top:8px}
+    table{width:100%;border-collapse:collapse;min-width:700px}
+    th,td{border-bottom:1px solid var(--line);padding:8px 10px;text-align:left;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;white-space:nowrap}
+    .muted{color:#9aa4af}
+    .pill{border:1px solid var(--line);padding:8px 10px;border-radius:10px;background:#0b0f14}
+  </style>
+</head>
+<body>
+<header>
+  <h1>LOGOS LRB — исследователь</h1>
+  <div class="pill">
+    <input id="q" placeholder="Поиск: RID, высота блока или псевдо-txid from:nonce" style="min-width:260px">
+    <button onclick="search()">Найти</button>
+  </div>
+  <div id="jsStat">js: загрузка…</div>
+</header>
+
+<main>
+
+  <section class="cards">
+    <div>
+      <h3>Голова</h3>
+      <div class="btns">
+        <button onclick="fetchHead()">GET /head</button>
+        <button onclick="toggleAuto()">Автообновление</button>
+      </div>
+      <pre id="out-head"></pre>
+    </div>
+    <div>
+      <h3>Эконом</h3>
+      <button onclick="fetchEconomy()">GET /economy</button>
+      <pre id="out-economy"></pre>
+    </div>
+  </section>
+
+  <section>
+    <h3>Блок</h3>
+    <div class="row">
+      <div class="grow"><label class="muted">высота блока</label><input id="inp-height" type="number" min="1" placeholder="например 1"></div>
+      <div class="grow btns" style="align-items:flex-end">
+        <button onclick="fetchBlock()">/block/:height</button>
+        <button onclick="fetchMix()">/block/:height/mix</button>
+        <button onclick="loadLatest()">Последние блоки</button>
+      </div>
+    </div>
+    <div class="table-wrap" id="latest-wrap" style="display:none">
+      <table><thead><tr><th>height</th><th>ts</th><th>finalized</th></tr></thead><tbody id="latest"></tbody></table>
+    </div>
+    <pre id="out-block"></pre>
+  </section>
+
+  <section>
+    <h3>Адрес (RID)</h3>
+    <div class="row">
+      <div class="grow"><label class="muted">RID (base58)</label><input id="inp-rid" placeholder="вставь RID"></div>
+      <div class="fit"><label class="muted">limit</label><input id="inp-limit" type="number" min="1" value="20"></div>
+      <div class="grow btns" style="align-items:flex-end"><button onclick="fetchHistory()">GET /history</button></div>
+    </div>
+    <div class="table-wrap">
+      <table id="tbl">
+        <thead><tr><th>nonce</th><th>from</th><th>to</th><th>amount</th><th>height</th><th>ts</th></tr></thead>
+        <tbody id="hist-body"></tbody>
+      </table>
+    </div>
+    <pre id="out-history" style="display:none"></pre>
+  </section>
+
+</main>
+
+<script>
+(function(){
+  const API = location.origin + "/api";
+  const $  = s => document.querySelector(s);
+  const setStat = (t,ok)=>{ const s=$("#jsStat"); if(!s) return; s.textContent=t; s.style.color=ok?"#0bd464":"#ff5252"; };
+  const fmtNum=n=>Number(n).toLocaleString("ru-RU");
+  const fmtTs =ms=>isFinite(ms)?new Date(Number(ms)).toLocaleString("ru-RU"):"";
+
+  async function jget(path){
+    try{ const r=await fetch(API+path,{cache:"no-store"}); if(!r.ok) return {error:r.status+" "+(await r.text()).slice(0,200)}; return await r.json(); }
+    catch(e){ return {error:String(e)}; }
+  }
+
+  // HEAD & ECON
+  let autoTimer=null;
+  window.fetchHead = async ()=>{ $("#out-head").textContent = JSON.stringify(await jget("/head"), null, 2); };
+  window.fetchEconomy = async ()=>{ $("#out-economy").textContent = JSON.stringify(await jget("/economy"), null, 2); };
+  window.toggleAuto = ()=>{
+    if(autoTimer){ clearInterval(autoTimer); autoTimer=null; setStat("js: авто выкл", true); return; }
+    const tick=async()=>{ await fetchHead(); await fetchEconomy(); };
+    tick(); autoTimer=setInterval(tick, 5000); setStat("js: авто вкл", true);
+  };
+
+  // BLOCKS
+  window.fetchBlock = async ()=>{
+    const h=Number($("#inp-height").value)||0; if(!h){ alert("Укажи высоту"); return; }
+    $("#out-block").textContent = JSON.stringify(await jget("/block/"+h), null, 2);
+    $("#latest-wrap").style.display="none";
+  };
+  window.fetchMix = async ()=>{
+    const h=Number($("#inp-height").value)||0; if(!h){ alert("Укажи высоту"); return; }
+    $("#out-block").textContent = JSON.stringify(await jget(`/block/${h}/mix`), null, 2);
+    $("#latest-wrap").style.display="none";
+  };
+  window.loadLatest = async ()=>{
+    const head=await jget("/head");
+    const H = head && head.height ? Number(head.height) : 0;
+    const tbody=$("#latest"); tbody.innerHTML="";
+    if(!H){ $("#latest-wrap").style.display="none"; return; }
+    const from=Math.max(1,H-9);  // последние 10
+    for(let h=H; h>=from; h--){
+      const b = await jget("/block/"+h);
+      const tr=document.createElement("tr");
+      tr.innerHTML = `<td>${h}</td><td>${b.ts_ms?fmtTs(b.ts_ms):""}</td><td>${b.finalized??""}</td>`;
+      tbody.appendChild(tr);
+    }
+    $("#latest-wrap").style.display="block";
+    $("#out-block").textContent = "";
+  };
+
+  // HISTORY
+  function renderRows(arr){
+    const tb=$("#hist-body"); tb.innerHTML="";
+    if(!arr || arr.length===0){ const tr=document.createElement("tr"); tr.innerHTML='<td colspan="6" class="muted">0 записей</td>'; tb.appendChild(tr); return; }
+    for(const tx of arr){
+      const tr=document.createElement("tr");
+      tr.innerHTML = `<td>${tx.nonce??""}</td><td>${tx.from??""}</td><td>${tx.to??""}</td>`+
+                     `<td>${fmtNum(tx.amount??0)}</td><td>${tx.height??""}</td><td>${fmtTs(tx.ts_ms)}</td>`;
+      tb.appendChild(tr);
+    }
+  }
+  window.fetchHistory = async ()=>{
+    const rid = ($("#inp-rid").value||"").trim(); if(!rid){ alert("Укажи RID"); return; }
+    const lim = Math.max(1, Number($("#inp-limit").value)||20);
+    const raw = await jget(`/history/${encodeURIComponent(rid)}?limit=${lim}`);
+    $("#out-history").style.display="block"; $("#out-history").textContent=JSON.stringify(raw,null,2);
+    const arr = (raw && (raw.items||raw.txs)) ? (raw.items||raw.txs) : [];
+    renderRows(arr);
+  };
+
+  // SEARCH (RID / block height / pseudo txid "from:nonce")
+  window.search = async ()=>{
+    const q = ($("#q").value||"").trim();
+    if(!q) return;
+    if(/^\d+$/.test(q)){ $("#inp-height").value=q; await fetchBlock(); return; }
+    if(/^[1-9A-HJ-NP-Za-km-z]+$/.test(q) && q.length>30){ $("#inp-rid").value=q; await fetchHistory(); return; }
+    if(q.includes(":")){ // псевдо-txid from:nonce
+      const [from,nonce] = q.split(":");
+      $("#inp-rid").value = from;
+      $("#inp-limit").value = 50;
+      await fetchHistory();
+      // подсветим найденную строку
+      [...document.querySelectorAll("#hist-body tr")].forEach(tr=>{
+        if(tr.firstChild && tr.firstChild.textContent===(nonce||"").trim()){ tr.style.background="#132235"; }
+      });
+      return;
+    }
+    alert("Не распознан формат запроса. Используй: RID, номер блока, или from:nonce");
+  };
+
+  // boot mark
+  setStat("js: готов", true);
+})();
+</script>
+</body>
+</html>
+
+```
+
+
+---
+
+# 8. Nginx конфиги
+
+
+
+=== /etc/nginx/conf.d/ratelimit.conf ===
+
+```nginx
+# === LOGOS LRB — единственное объявление зон ===
+# QPS основного API (tx) ~30 r/s, запас 20m
+limit_req_zone  $binary_remote_addr  zone=logos_tx_api:20m  rate=30r/s;
+
+# QPS метрик ~5 r/s, маленькая зона
+limit_req_zone  $binary_remote_addr  zone=logos_metrics:4m  rate=5r/s;
+
+# Ограничение одновременных коннектов на IP
+limit_conn_zone $binary_remote_addr  zone=logos_conn_api:10m;
+
+```
+
+
+---
+
+# 9. Systemd (unit + drop-ins)
+
+
+
+=== systemctl cat logos-node ===
+
+```text
+# /etc/systemd/system/logos-node.service
+[Unit]
+Description=LOGOS LRB Node
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+User=logos
+Group=logos
+ExecStart=/opt/logos/bin/logos_node
+Restart=on-failure
+RestartSec=2
+
+# security hardening
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/lib/logos
+
+# env & secrets
+EnvironmentFile=/etc/logos/keys.env
+Environment=RUST_LOG=info
+[Install]
+WantedBy=multi-user.target
+
+# /etc/systemd/system/logos-node.service.d/00-prod.conf
+[Service]
+Environment=LRB_DATA_PATH=/var/lib/logos/data.sled
+Environment=LRB_NODE_LISTEN=127.0.0.1:8080
+Environment=LRB_ARCHIVE_URL=postgres://logos:StrongPass123@127.0.0.1:5432/logos
+Environment=LRB_WALLET_ORIGIN=https://45-159-248-232.sslip.io
+Environment=LRB_SLOT_MS=200
+# сгенерируй рандомные секреты:
+#  openssl rand -hex 32
+Environment=LRB_JWT_SECRET=CHANGE_ME
+Environment=LRB_BRIDGE_KEY=CHANGE_ME
+
+```
+
+
+=== /etc/systemd/system/logos-node.service.d/00-prod.conf ===
+
+```nginx
+[Service]
+Environment=LRB_DATA_PATH=/var/lib/logos/data.sled
+Environment=LRB_NODE_LISTEN=127.0.0.1:8080
+Environment=LRB_ARCHIVE_URL=postgres://logos:StrongPass123@127.0.0.1:5432/logos
+Environment=LRB_WALLET_ORIGIN=https://45-159-248-232.sslip.io
+Environment=LRB_SLOT_MS=200
+# сгенерируй рандомные секреты:
+#  openssl rand -hex 32
+Environment=LRB_JWT_SECRET=CHANGE_ME
+Environment=LRB_BRIDGE_KEY=CHANGE_ME
+
+```
+
+
+=== /etc/systemd/system/logos-node.service.d/zz-keys.conf.disabled ===
+
+```text
+[Service]
+# Читаем файл с секретами (на будущее, если захочешь использовать keys.env)
+EnvironmentFile=-/etc/logos/keys.env
+
+# Узловые параметры (жёстко, чтобы сервис точно стартовал)
+Environment=LRB_DATA_PATH=/var/lib/logos/data.sled
+Environment=LRB_NODE_SK_HEX=31962399e9b0e278af3b328bc6e30bbd17d90c700a5f6c7ad3c4d4418ed8fd83
+Environment=LRB_ADMIN_KEY=0448012cf1738fd048b154a1c367cb7cb42e3fee4ab26fb04268ab91e09fb475
+Environment=LRB_BRIDGE_KEY=CHANGE_ME
+
+```
+
+
+---
+
+# 10. Бэкап sled
+
+
+
+=== /usr/local/bin/logos-sled-backup.sh ===
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+SRC="/var/lib/logos/data.sled"
+DST="/root/sled_backups"
+KEEP=96          # ~24 часа при шаге 15 минут
+MAX_GB=20        # общий лимит в гигабайтах
+
+TS="$(date -Iseconds)"
+mkdir -p "$DST"
+
+# 1) инкрементальный снапшот (rsync в новую папку)
+rsync -a --delete "$SRC/" "$DST/data.sled.$TS.bak/"
+
+# 2) ротация по количеству
+mapfile -t LIST < <(ls -1dt "$DST"/data.sled.*.bak 2>/dev/null || true)
+if (( ${#LIST[@]} > KEEP )); then
+  for d in "${LIST[@]:$KEEP}"; do
+    rm -rf -- "$d" || true
+  done
+fi
+
+# 3) ротация по общему размеру
+du_mb() { du -sm "$DST" | awk '{print $1}'; }
+while (( $(du_mb) > MAX_GB*1024 )); do
+  OLDEST="$(ls -1dt "$DST"/data.sled.*.bak | tail -n 1 || true)"
+  [[ -n "$OLDEST" ]] || break
+  rm -rf -- "$OLDEST" || true
+done
+
+```
+
+
+=== /etc/systemd/system/logos-sled-backup.service ===
+
+```ini
+[Unit]
+Description=Backup sled to /root/sled_backups
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/bin/logos-sled-backup.sh
+
+```
+
+
+=== /etc/systemd/system/logos-sled-backup.timer ===
+
+```ini
+[Unit]
+Description=Run sled backup every 15 minutes
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=15m
+Unit=logos-sled-backup.service
+
+[Install]
+WantedBy=timers.target
+
+```
+
+
+---
+
+# 11. Prometheus/Grafana (alerts)
+
+
+
+=== /etc/prometheus/rules/logos_alerts.yml ===
+
+```yaml
+groups:
+- name: logos-runtime
+  rules:
+  - alert: HeightStuck
+    expr: increase(logos_head_height[5m]) == 0
+    for: 3m
+    labels: { severity: critical }
+    annotations: { summary: "Head не растёт 5 минут" }
+
+  - alert: HighLatencyP99
+    expr: histogram_quantile(0.99, sum(rate(http_request_duration_ms_bucket[5m])) by (le)) > 120
+    for: 2m
+    labels: { severity: warning }
+    annotations: { summary: "p99 HTTP > 120 ms" }
+
+  - alert: TLSExpirySoon
+    expr: (probe_ssl_earliest_cert_expiry - time()) < 14*24*3600
+    for: 10m
+    labels: { severity: warning }
+    annotations: { summary: "TLS сертификат истекает < 14 дней" }
+
+```
+
+
+---
+
+# 12. Конфиги
+
+
+
+=== /root/logos_lrb/configs/genesis.yaml ===
+
+```yaml
+
+```
+
+
+=== /root/logos_lrb/configs/logos_config.yaml ===
+
+```yaml
+
+```
+
+
+---
+
+# 13. OpenAPI контракт
+
+
+
+=== GET /openapi.json ===
+
+```text
+
+```
+
+
+---
+
+# 14. Bootstrap на новом сервере (шаги)
+
+
+### Ubuntu 22.04/24.04 (root)
+```bash
+apt update && apt install -y curl git jq build-essential pkg-config libssl-dev \
+  nginx postgresql postgresql-contrib rsync
+
+# Rust
+curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. $HOME/.cargo/env
+
+# Клонируем проект
+git clone https://github.com/Lgn-rsp/logos_lrb.git /root/logos_lrb
+cd /root/logos_lrb
+
+# По канону вставляем файлы из этой книги (см. главы 3–13):
+# cd → rm -f → nano → вставить контент блока === <path> === → сохранить
+
+# Systemd drop-ins — ЗАМЕНИТЬ CHANGE_ME на реальные секреты
+sudo mkdir -p /etc/systemd/system/logos-node.service.d
+sudo tee /etc/systemd/system/logos-node.service.d/zz-secrets-inline.conf >/dev/null <<EOF
+[Service]
+Environment=LRB_JWT_SECRET=CHANGE_ME
+Environment=LRB_BRIDGE_KEY=CHANGE_ME
+EOF
+sudo tee /etc/systemd/system/logos-node.service.d/paths.conf >/dev/null <<EOF
+[Service]
+Environment=LRB_DATA_PATH=/var/lib/logos/data.sled
+Environment=LRB_NODE_KEY_PATH=/var/lib/logos/node_key
+EOF
+sudo systemctl daemon-reload
+
+# Сборка/деплой
+cargo build --release -p logos_node
+install -m 0755 target/release/logos_node /opt/logos/bin/logos_node
+sudo chown logos:logos /opt/logos/bin/logos_node
+sudo systemctl restart logos-node
+sleep 1
+curl -s http://127.0.0.1:8080/healthz; echo
+curl -s http://127.0.0.1:8080/head; echo
+
+# Nginx
+nginx -t && systemctl reload nginx
+```
+
+---
+
+# 15. Канон проверки
+
+
+```bash
+journalctl -u logos-node -n 120 --no-pager | egrep -i "listening|panic|error" || true
+curl -s http://127.0.0.1:8080/healthz; echo
+curl -s http://127.0.0.1:8080/head; echo
+curl -s http://127.0.0.1:8080/economy | jq
+curl -s "http://127.0.0.1:8080/archive/blocks?limit=3" | jq
+curl -s "http://127.0.0.1:8080/archive/txs?limit=3"    | jq
+```
