@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.."; pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 SNAP_NAME="LOGOS_WEB_STACK_SNAPSHOT_$(date -u +%Y-%m-%dT%H-%M-%SZ).md"
 OUT="$ROOT_DIR/docs/LOGOS_WEB_STACK/$SNAP_NAME"
+
+mkdir -p "$ROOT_DIR/docs/LOGOS_WEB_STACK"
 
 echo "# LOGOS Web Stack Snapshot" > "$OUT"
 echo "" >> "$OUT"
@@ -64,18 +66,18 @@ dump_dir () {
         local EXT="${FILE##*.}"
         local LANG=""
         case "$EXT" in
-          py)     LANG="python" ;;
-          html|htm) LANG="html" ;;
-          js)     LANG="javascript" ;;
-          ts)     LANG="typescript" ;;
-          css)    LANG="css" ;;
-          md)     LANG="markdown" ;;
-          json)   LANG="json" ;;
-          toml)   LANG="toml" ;;
-          yml|yaml) LANG="yaml" ;;
-          sh)     LANG="bash" ;;
+          py)          LANG="python" ;;
+          html|htm)    LANG="html" ;;
+          js)          LANG="javascript" ;;
+          ts)          LANG="typescript" ;;
+          css)         LANG="css" ;;
+          md)          LANG="markdown" ;;
+          json)        LANG="json" ;;
+          toml)        LANG="toml" ;;
+          yml|yaml)    LANG="yaml" ;;
+          sh)          LANG="bash" ;;
           service|socket|conf) LANG="ini" ;;
-          *)      LANG="" ;;
+          *)           LANG="" ;;
         esac
 
         if [ -n "$LANG" ]; then
@@ -109,8 +111,8 @@ dump_file () {
   local LANG=""
   case "$EXT" in
     service|socket|conf) LANG="ini" ;;
-    env) LANG="bash" ;;
-    *) LANG="" ;;
+    env)                 LANG="bash" ;;
+    *)                   LANG="" ;;
   esac
 
   if [ -n "$LANG" ]; then
@@ -130,13 +132,16 @@ dump_dir "/var/www/logos/landing" "Landing / Frontend"
 # 2. Telegram guard bot
 dump_dir "/var/www/logos/landing/logos_tg_bot/logos_guard_bot" "Telegram Guard Bot"
 
-# 3. Airdrop API backend
+# 3. X Guard (Twitter integration) — модуль из репозитория
+dump_dir "/root/logos_lrb/modules/x_guard" "X Guard (Twitter Guard Service)"
+
+# 4. Airdrop API backend
 dump_dir "/opt/logos/airdrop-api" "Airdrop API Backend"
 
-# 4. systemd и env
+# 5. systemd и env
 dump_file "/etc/systemd/system/logos-airdrop-api.service" "systemd: logos-airdrop-api.service"
-dump_file "/etc/systemd/system/logos-x-guard.service" "systemd: logos-x-guard.service"
-dump_file "/etc/logos/airdrop-api.env" "Env: /etc/logos/airdrop-api.env"
+dump_file "/etc/systemd/system/logos-x-guard.service"     "systemd: logos-x-guard.service"
+dump_file "/etc/logos/airdrop-api.env"                    "Env: /etc/logos/airdrop-api.env"
 
 echo ""
 echo "Snapshot written to: $OUT"
