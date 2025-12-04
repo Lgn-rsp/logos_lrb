@@ -11,7 +11,7 @@ pub async fn claim_settle(State(st):State<Arc<AppState>>, Json(req):Json<ClaimRe
     {
         let l = st.ledger.lock();
         let bal = l.get_balance(&req.rid).unwrap_or(0);
-        let newb = bal.saturating_add(req.amount);
+        let newb = bal.saturating_add(req.amount as u128);
         if let Err(e) = l.set_balance(&req.rid, newb as u128) {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("{{\"error\":\"{e}\"}}"));
         }

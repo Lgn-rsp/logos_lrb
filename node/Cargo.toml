@@ -6,30 +6,17 @@ license     = "Apache-2.0"
 description = "LOGOS LRB node: Axum REST + archive + producer + wallet/stake"
 build       = "build.rs"
 
-# --- бинарь узла ---
+# Основной бинарь узла
 [[bin]]
 name = "logos_node"
 path = "src/main.rs"
-
-# --- вспомогательные утилиты (можно закомментировать, если не нужны) ---
-[[bin]]
-name = "mint"
-path = "src/bin/mint.rs"
-
-[[bin]]
-name = "make_tx"
-path = "src/bin/make_tx.rs"
-
-[[bin]]
-name = "bench_burst"
-path = "src/bin/bench_burst.rs"
 
 [lib]
 name = "logos_node"
 path = "src/lib.rs"
 
 [dependencies]
-# базовый стек (всё из workspace — единые версии)
+# базовый стек (всё из workspace)
 axum.workspace                = true
 tower.workspace               = true
 tower-http.workspace          = true
@@ -62,16 +49,13 @@ ipnet.workspace               = true
 prometheus.workspace          = true
 uuid.workspace                = true
 
-# === ДОБАВЛЕНО (security & utils) ===
-# HMAC-SHA256 для подписи тела моста (deposit/redeem)
+# security & utils
 hmac = { version = "0.12", default-features = false }
-# джиттер/phase-mixing в guard
 rand = { version = "0.8", features = ["std","std_rng"] }
-# мьютексы в state.rs (parking_lot::Mutex)
 parking_lot = "0.12"
 
-# для bin-утилит
-reqwest   = { workspace = true, features = ["blocking","json"] }
+# HTTP‑клиент (bridge payout + утилиты)
+reqwest   = { workspace = true, features = ["rustls-tls","http2","json","blocking"] }
 rand_core = "0.6"
 
 # ядро

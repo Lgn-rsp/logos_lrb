@@ -5,24 +5,78 @@
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>LOGOS Wallet — Кошелёк</title>
   <style>
-    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0b0c10;color:#e6edf3}
-    header{padding:16px 20px;background:#11151a;border-bottom:1px solid #1e242c;position:sticky;top:0}
+    body{
+      font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;
+      margin:0;background:#0b0c10;color:#e6edf3
+    }
+    header{
+      padding:12px 20px 10px;
+      background:#11151a;
+      border-bottom:1px solid #1e242c;
+      position:sticky;top:0;z-index:10
+    }
     h1{font-size:18px;margin:0}
-    main{max-width:1024px;margin:24px auto;padding:0 16px}
-    section{background:#11151a;margin:16px 0;border-radius:12px;padding:16px;border:1px solid #1e242c}
+    header .sub{
+      font-size:12px;
+      opacity:.8;
+      margin-top:4px
+    }
+    main{
+      max-width:1024px;
+      margin:24px auto;
+      padding:0 16px 40px
+    }
+    section{
+      background:#11151a;
+      margin:16px 0;
+      border-radius:12px;
+      padding:16px;
+      border:1px solid #1e242c
+    }
+    h3{margin:0 0 8px;font-size:16px}
     label{display:block;margin:8px 0 6px}
-    .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-    @media (max-width:900px){.grid{grid-template-columns:1fr}}
-    input,button,textarea{width:100%;padding:10px;border-radius:10px;border:1px solid #2a313a;background:#0b0f14;color:#e6edf3}
-    button{cursor:pointer;border:1px solid #3b7ddd;background:#1665c1}
+    .grid{
+      display:grid;
+      grid-template-columns:1fr 1fr;
+      gap:12px
+    }
+    @media (max-width:900px){
+      .grid{grid-template-columns:1fr}
+    }
+    input,button,textarea{
+      width:100%;
+      padding:10px;
+      border-radius:10px;
+      border:1px solid #2a313a;
+      background:#0b0f14;
+      color:#e6edf3;
+      box-sizing:border-box;
+      font-size:14px;
+    }
+    textarea{resize:vertical;min-height:70px}
+    button{
+      cursor:pointer;
+      border:1px solid #3b7ddd;
+      background:#1665c1;
+    }
     button.secondary{background:#1b2129}
+    button:disabled{opacity:.6;cursor:not-allowed}
     .mono{font-family:ui-monospace,Menlo,Consolas,monospace}
     small{opacity:.8}
+    pre{
+      background:#0b0f14;
+      border-radius:10px;
+      border:1px solid #2a313a;
+      padding:8px;
+      font-size:13px;
+      white-space:pre-wrap;
+    }
   </style>
 </head>
 <body>
 <header>
   <h1>LOGOS Wallet — Кошелёк</h1>
+  <div class="sub">Endpoint: <span id="endpoint" class="mono"></span></div>
 </header>
 <main>
   <section>
@@ -34,15 +88,25 @@
           <button id="btn-lock" class="secondary">Выйти (заблокировать)</button>
           <button id="btn-nonce" class="secondary">Получить nonce</button>
         </div>
-        <p><small>Ключ в памяти. Закроешь вкладку — понадобится пароль на странице входа.</small></p>
+        <p><small>
+          Ключи лежат только в памяти этой вкладки. После 15 минут бездействия или
+          закрытия вкладки кошелёк автоматически блокируется — при следующем входе
+          нужен пароль.
+        </small></p>
       </div>
       <div>
         <h3>Баланс</h3>
         <div class="grid">
-          <div><label>RID</label><input id="rid-balance" class="mono" placeholder="RID (base58)"/></div>
-          <div><label>&nbsp;</label><button id="btn-balance">Показать баланс</button></div>
+          <div>
+            <label>RID</label>
+            <input id="rid-balance" class="mono" placeholder="RID (base58)"/>
+          </div>
+          <div>
+            <label>&nbsp;</label>
+            <button id="btn-balance">Показать баланс</button>
+          </div>
         </div>
-        <pre id="out-balance" class="mono" style="margin-top:12px"></pre>
+        <pre id="out-balance" class="mono" style="margin-top:12px;min-height:40px"></pre>
       </div>
     </div>
   </section>
@@ -50,25 +114,72 @@
   <section>
     <h3>Подпись и отправка (batch)</h3>
     <div class="grid">
-      <div><label>Получатель (RID)</label><input id="to" class="mono" placeholder="RID получателя"/></div>
-      <div><label>Сумма (LGN)</label><input id="amount" type="number" min="1" step="1" value="1"/></div>
+      <div>
+        <label>Получатель (RID)</label>
+        <input id="to" class="mono" placeholder="RID получателя"/>
+      </div>
+      <div>
+        <label>Сумма (LGN)</label>
+        <input id="amount" type="number" min="1" step="1" value="1"/>
+      </div>
     </div>
     <div class="grid">
-      <div><label>Nonce</label><input id="nonce" type="number" min="1" step="1" placeholder="нажми 'Получить nonce'"/></div>
-      <div><label>&nbsp;</label><button id="btn-send">Подписать и отправить</button></div>
+      <div>
+        <label>Nonce</label>
+        <input id="nonce" type="number" min="1" step="1" placeholder="нажми «Получить nonce»"/>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <button id="btn-send">Подписать и отправить</button>
+      </div>
     </div>
-    <pre id="out-send" class="mono" style="margin-top:12px"></pre>
+    <pre id="out-send" class="mono" style="margin-top:12px;min-height:40px"></pre>
+  </section>
+
+  <section>
+    <h3>Стейкинг (delegate / undelegate / claim)</h3>
+    <p><small>
+      Здесь можно залочить токены в стейкинг (delegate), снять часть/всё (undelegate) и
+      забрать накопленные награды (claim). Все операции идут через REST /stake/*.
+    </small></p>
+    <div class="grid">
+      <div>
+        <label>Текущий статус стейкинга</label>
+        <pre id="out-stake" class="mono" style="min-height:80px"></pre>
+        <button id="btn-stake-refresh" class="secondary" style="margin-top:8px">
+          Обновить статус стейкинга
+        </button>
+      </div>
+      <div>
+        <label>Застейкать (делегировать, LGN)</label>
+        <input id="stake-amount" type="number" min="1" step="1" value="0"/>
+        <button id="btn-stake-delegate" style="margin-top:8px">Делегировать</button>
+
+        <label style="margin-top:14px">Разстейкать (undelegate, LGN)</label>
+        <input id="unstake-amount" type="number" min="1" step="1" value="0"/>
+        <button id="btn-stake-undelegate" style="margin-top:8px">Снять делегацию</button>
+
+        <label style="margin-top:14px">Накопленные награды</label>
+        <button id="btn-stake-claim" style="margin-top:8px">Заявить награду (claim)</button>
+      </div>
+    </div>
   </section>
 
   <section>
     <h3>Мост rToken (депозит, демо)</h3>
     <div class="grid">
-      <div><label>ext_txid</label><input id="ext" class="mono" placeholder="например eth_txid_0xabc"/></div>
-      <div><label>&nbsp;</label><button id="btn-deposit">Deposit rLGN</button></div>
+      <div>
+        <label>ext_txid</label>
+        <input id="ext" class="mono" placeholder="например eth_txid_0xabc"/>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <button id="btn-deposit">Deposit rLGN (demo)</button>
+      </div>
     </div>
-    <pre id="out-bridge" class="mono" style="margin-top:12px"></pre>
+    <pre id="out-bridge" class="mono" style="margin-top:12px;min-height:40px"></pre>
   </section>
 </main>
-<script src="./app.js?v=20250906_01" defer></script>
+<script src="./app.js?v=20251129_01" defer></script>
 </body>
 </html>

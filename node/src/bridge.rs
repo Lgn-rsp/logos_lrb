@@ -40,7 +40,7 @@ pub async fn deposit(State(st):State<Arc<AppState>>, Json(req):Json<DepositReq>)
     {
         let l = st.ledger.lock();
         let bal  = l.get_balance(&req.rid).unwrap_or(0);
-        let newb = bal.saturating_add(req.amount);
+        let newb = bal.saturating_add(req.amount as u128);
         if let Err(e) = l.set_balance(&req.rid, newb as u128) {
             error!("deposit set_balance: {e}");
             let _ = j.set_status(&op.op_id, OpStatus::Failed, Some(e.to_string()));
@@ -73,11 +73,11 @@ pub async fn redeem(State(st):State<Arc<AppState>>, Json(req):Json<RedeemReq>) -
     {
         let l = st.ledger.lock();
         let bal = l.get_balance(&req.rid).unwrap_or(0);
-        if bal < req.amount {
+        if bal < req.amount as u128 {
             metrics::inc_bridge("redeem","insufficient");
             return (StatusCode::BAD_REQUEST, "{\"error\":\"insufficient\"}".into());
         }
-        let newb = bal - req.amount;
+        let newb = bal.saturating_sub(req.amount as u128);
         if let Err(e) = l.set_balance(&req.rid, newb as u128) {
             error!("redeem set_balance: {e}");
             let _ = j.set_status(&op.op_id, OpStatus::Failed, Some(e.to_string()));
@@ -117,7 +117,7 @@ async fn retry_deposit(st:&AppState, j:&Journal, op:&JournalOp){
     {
         let l = st.ledger.lock();
         let bal  = l.get_balance(&op.rid).unwrap_or(0);
-        let newb = bal.saturating_add(op.amount);
+        let newb = bal.saturating_add(op.amount as u128);
         if l.set_balance(&op.rid, newb as u128).is_ok(){
             let _ = j.set_status(&op.op_id, OpStatus::Confirmed, None);
             metrics::inc_bridge("deposit","confirmed");
@@ -163,3 +163,9 @@ pub async fn health(State(st):State<Arc<AppState>>)->(StatusCode,String){
         Err(e)      => (StatusCode::INTERNAL_SERVER_ERROR, format!("{{\"error\":\"{e}\"}}")),
     }
 }
+
+// ------- JSON-обёртки для совместимости -------
+// /bridge/deposit_json и /bridge/redeem_json указывают на те же хендлеры,
+// что и /bridge/deposit и /bridge/redeem.
+pub use deposit as deposit_json;
+pub use redeem as redeem_json;

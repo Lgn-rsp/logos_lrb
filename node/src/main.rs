@@ -35,15 +35,16 @@ fn router(app_state: Arc<state::AppState>) -> Router {
         .route("/head",    get(api::head))
         .route("/balance/:rid", get(api::balance))
         .route("/submit_tx",       post(api::submit_tx))
+        .route("/debug_canon",  post(api::submit_tx))
         .route("/submit_tx_batch", post(api::submit_tx_batch))
         .route("/economy",         get(api::economy))
         .route("/history/:rid",    get(api::history))
 
         // --- archive API (PG) ---
-        .route("/archive/blocks",      get(api::archive_blocks))
-        .route("/archive/txs",         get(api::archive_txs))
-        .route("/archive/history/:rid",get(api::archive_history))
-        .route("/archive/tx/:txid",    get(api::archive_tx))
+        .route("/archive/blocks",       get(api::archive_blocks))
+        .route("/archive/txs",          get(api::archive_txs))
+        .route("/archive/history/:rid", get(api::archive_history))
+        .route("/archive/tx/:txid",     get(api::archive_tx))
 
         // --- staking wrappers (совместимость с фронтом) ---
         .route("/stake/delegate",   post(api::stake_delegate))
@@ -75,9 +76,9 @@ fn router(app_state: Arc<state::AppState>) -> Router {
         .route("/health/bridge",  get(bridge::health))
 
         // --- version / metrics / openapi ---
-        .route("/version",     get(version::get))
-        .route("/metrics",     get(metrics::prometheus))
-        .route("/openapi.json",get(openapi::serve))
+        .route("/version",      get(version::get))
+        .route("/metrics",      get(metrics::prometheus))
+        .route("/openapi.json", get(openapi::serve))
 
         // --- admin ---
         .route("/admin/set_balance", post(admin::set_balance))
@@ -104,17 +105,20 @@ fn router(app_state: Arc<state::AppState>) -> Router {
 async fn main() -> anyhow::Result<()> {
     // logging
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,hyper=warn")))
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,hyper=warn"))
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // secrets/keys
+    // secrets/keys (JWT, bridge key и т.п.)
     auth::assert_secrets_on_start().expect("secrets missing");
 
     // state
     let app_state = Arc::new(state::AppState::new()?);
 
-    // optional archive
+    // optional archive из ENV
     if let Some(ar) = crate::archive::Archive::new_from_env().await {
         unsafe {
             let p = Arc::as_ptr(&app_state) as *mut state::AppState;
@@ -125,15 +129,15 @@ async fn main() -> anyhow::Result<()> {
         warn!("archive disabled");
     }
 
-    // producer
+    // producer (в нашей сборке локальный продюсер выключен и работает как follower)
     info!("producer start");
     let _producer = producer::run(app_state.clone());
 
-    // bridge retry worker
+    // воркер повторных выплат моста
     tokio::spawn(bridge::retry_worker(app_state.clone()));
 
     // bind & serve
-    let addr = state::bind_addr();
+    let addr = state::bind_addr()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("logos_node listening on {addr}");
     axum::serve(listener, router(app_state)).await?;
