@@ -1,3 +1,4 @@
+y
 import os, json, time, asyncio
 from typing import Optional, Literal
 from fastapi import FastAPI, HTTPException
@@ -41,6 +42,43 @@ class SeenTx(Base):
 
 engine = create_engine(DB_URL, future=True)
 Base.metadata.create_all(engine)
+
+from eth_utils import to_checksum_address
+
+# ...
+
+def _hot_pk_bytes() -> bytes:
+    if not HOT_PK:
+        raise HTTPException(500, "HOT wallet not configured")
+    pk = HOT_PK.strip()
+    # если это hex-строка приватника
+    if pk.startswith("0x") and len(pk) in (66, 64 + 2):
+        return bytes.fromhex(pk[2:])
+    # fallback: просто UTF‑8, если вдруг формат другой (dev)
+    return pk.encode("utf-8")
+
+
+def derive_deposit_address(rid: str, token: str, network: str) -> str:
+    """
+    Детерминированно получаем ETH-адрес для депозита по (rid, token, network).
+
+    ВАЖНО: seed зависит от HOT_PK и входных данных → без HOT_PK
+    приватный ключ депозитного адреса не восстановить.
+    """
+    if not w3:
+        raise HTTPException(503, "ETH RPC not connected")
+
+    base = _hot_pk_bytes()
+    seed = f"{rid}|{token}|{network}|LOGOS_DEPOSIT_V1".encode("utf-8")
+    digest = Web3.keccak(base + seed)  # 32 байта
+
+    try:
+        acct = w3.eth.account.from_key(digest)
+    except Exception as e:
+        # совсем параноидальный fallback, на практике сюда не попадём
+        raise HTTPException(500, f"failed to derive deposit address: {e}")
+
+    return to_checksum_address(acct.address)
 
 # ====== Web3 ======
 w3: Optional[Web3] = None

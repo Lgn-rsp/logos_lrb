@@ -2,19 +2,21 @@
 
 // -------------------- CONFIG / GLOBALS --------------------
 
-const API = location.origin.replace(/\/$/, '') + '/api';
+// Базовый endpoint API. Для прод‑узла это https://<твой-домен>/api
+// Для локальной ноды — origin + /api.
+const API = (window.API_ENDPOINT || (location.origin.replace(/\/$/, '') + '/api'));
 
 const DB_NAME  = 'logos_wallet_v2';
 const DB_STORE = 'keys';
-const AUTOLOCK_MS = 15 * 60 * 1000; // 15 минут
+const AUTOLOCK_MS = 15 * 60 * 1000; // 15 минут бездействия → автолок
 
 const enc = new TextEncoder();
 
 let RID  = sessionStorage.getItem('logos_rid') || '';
 let PASS = sessionStorage.getItem('logos_pass') || '';
 
-let META = null;
-let KEYS = null; // { privateKey: CryptoKey }
+let META = null;             // { rid, pub: number[], salt: number[], iv: number[], priv: number[] }
+let KEYS = null;             // { privateKey: CryptoKey }
 let lastActivity = Date.now();
 
 // -------------------- DOM HELPERS --------------------
@@ -34,14 +36,18 @@ function lockNow() {
     sessionStorage.removeItem('logos_pass');
     sessionStorage.removeItem('logos_rid');
   } catch (_) {}
-  alert('Сессия кошелька завершена, войди ещё раз.');
-  location.href = './index.html';
+  alert('Сессия кошелька завершена, войди снова.');
+  try {
+    location.href = './auth.html';
+  } catch (_) {}
 }
 
 function ensureEnv() {
-  if (!window.crypto || !window.crypto.subtle || !window.indexedDB) {
-    alert('Браузер слишком старый, нужен WebCrypto и IndexedDB.');
-    throw new Error('Unsupported browser');
+  if (!window.isSecureContext) {
+    throw new Error('Нужен HTTPS (secure context)');
+  }
+  if (!window.crypto || !window.crypto.subtle) {
+    throw new Error('Нужен современный браузер с WebCrypto');
   }
   if (!RID || !PASS) {
     throw new Error('Нет активной сессии (RID/PASS)');
@@ -60,7 +66,7 @@ function openDb() {
       }
     };
     req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onerror   = () => reject(req.error);
   });
 }
 
@@ -71,68 +77,69 @@ async function idbGet(key) {
     const st = tx.objectStore(DB_STORE);
     const req = st.get(key);
     req.onsuccess = () => resolve(req.result || null);
-    req.onerror = () => reject(req.error);
+    req.onerror   = () => reject(req.error);
   });
 }
 
 // -------------------- CRYPTO HELPERS --------------------
 
-// PBKDF2(pass, salt) -> AES‑GCM key
-async function deriveKey(pass, salt, iterations = 120_000) {
-  const pw = await crypto.subtle.importKey(
+// PBKDF2(pass, salt) -> AES‑GCM key (совместимо с auth.js)
+async function deriveKey(pass, saltArr) {
+  const salt = saltArr instanceof Uint8Array ? saltArr : new Uint8Array(saltArr || []);
+  const keyMat = await crypto.subtle.importKey(
     'raw',
     enc.encode(pass),
     'PBKDF2',
     false,
-    ['deriveKey']
+    ['deriveKey'],
   );
   return crypto.subtle.deriveKey(
-    {
-      name: 'PBKDF2',
-      salt: new Uint8Array(salt),
-      iterations,
-      hash: 'SHA-256'
-    },
-    pw,
+    { name: 'PBKDF2', salt, iterations: 120000, hash: 'SHA-256' },
+    keyMat,
     { name: 'AES-GCM', length: 256 },
     false,
-    ['encrypt', 'decrypt']
+    ['encrypt', 'decrypt'],
   );
 }
 
-async function aesDecrypt(aesKey, iv, ct) {
+async function aesDecrypt(aesKey, ivArr, ctArr) {
+  const iv = ivArr instanceof Uint8Array ? ivArr : new Uint8Array(ivArr || []);
+  const ct = ctArr instanceof Uint8Array ? ctArr : new Uint8Array(ctArr || []);
   const plain = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: new Uint8Array(iv) },
+    { name: 'AES-GCM', iv },
     aesKey,
-    new Uint8Array(ct)
+    ct,
   );
   return new Uint8Array(plain);
 }
 
-// hex
+// hex helpers
 function toHex(arr) {
-  return Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('');
+  return Array.from(arr).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
-function fromHex(str) {
-  const clean = (str || '').trim();
-  if (clean.length % 2 !== 0) throw new Error('bad hex length');
+function fromHex(hex) {
+  const clean = (hex || '').trim();
+  if (clean.length % 2 !== 0) {
+    throw new Error('нечётная длина hex');
+  }
   const out = new Uint8Array(clean.length / 2);
   for (let i = 0; i < out.length; i++) {
-    out[i] = parseInt(clean.substr(i * 2, 2), 16);
+    out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
   }
   return out;
 }
 
-// -------------------- REST HELPERS --------------------
+// -------------------- HTTP HELPERS --------------------
 
-async function getJSON(url, init = {}) {
+async function getJSON(url) {
   const resp = await fetch(url, {
     method: 'GET',
     credentials: 'same-origin',
     cache: 'no-store',
-    ...init
   });
-  if (!resp.ok) throw new Error(`${resp.url || url} ${resp.status}`);
+  if (!resp.ok) {
+    throw new Error(`${url} ${resp.status}`);
+  }
   return resp.json();
 }
 
@@ -142,12 +149,17 @@ async function postJSON(url, body) {
     credentials: 'same-origin',
     cache: 'no-store',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body ?? {}),
   });
-  if (!resp.ok) throw new Error(`${resp.url || url} ${resp.status}`);
+  if (!resp.ok) {
+    throw new Error(`${url} ${resp.status}`);
+  }
   return resp.json();
 }
 
+// -------------------- NODE API WRAPPERS --------------------
+
+// /balance/:rid → { balance, nonce }
 async function getNonce(rid) {
   const j = await getJSON(`${API}/balance/${encodeURIComponent(rid)}`);
   if (!j || typeof j.nonce !== 'number') {
@@ -156,21 +168,26 @@ async function getNonce(rid) {
   return j.nonce;
 }
 
+// /debug_canon: сервер сейчас ждёт ApiSubmitTx
+// { from, to, amount, nonce, sig_hex } → { canon_hex, txid? }
 async function canonHex(from, to, amount, nonce) {
-  const j = await postJSON(`${API}/debug_canon`, {
-    tx: {
-      from,
-      to,
-      amount: Number(amount),
-      nonce: Number(nonce)
-    }
-  });
+  const body = {
+    from,
+    to,
+    amount: Number(amount),
+    nonce: Number(nonce),
+    // сервер требует поле sig_hex, но для канонизации оно не нужно —
+    // передаём пустую строку
+    sig_hex: '',
+  };
+  const j = await postJSON(`${API}/debug_canon`, body);
   if (!j || typeof j.canon_hex !== 'string') {
     throw new Error('сервер не вернул canon_hex');
   }
   return j.canon_hex;
 }
 
+// /submit_tx_batch { txs: [ { from,to,amount,nonce,sig_hex } ] }
 async function submitBatch(txs) {
   return postJSON(`${API}/submit_tx_batch`, { txs });
 }
@@ -189,6 +206,16 @@ async function stakeClaim() {
   return postJSON(`${API}/stake/claim`, { rid: RID });
 }
 
+// bridge deposit (demo)
+async function bridgeDeposit(rid, amount, ext) {
+  return postJSON(`${API}/bridge/deposit`, {
+    rid,
+    amount: Number(amount),
+    ext_txid: String(ext || ''),
+  });
+}
+
+// Подпись Ed25519(canonHex)
 async function signCanon(canonHexStr) {
   if (!KEYS || !KEYS.privateKey) throw new Error('ключи не загружены');
   const msg = fromHex(canonHexStr);
@@ -207,6 +234,7 @@ async function refreshBalance() {
     const j = await getJSON(`${API}/balance/${encodeURIComponent(rid)}`);
     out.textContent = JSON.stringify(j, null, 2);
   } catch (e) {
+    console.error(e);
     out.textContent = 'ERR: ' + e;
   }
 }
@@ -215,20 +243,13 @@ async function refreshStake() {
   const out = $('#out-stake');
   if (!out) return;
   try {
-    const j = await getStakeInfo(RID);
-    out.textContent = JSON.stringify(j, null, 2);
+    const info = await getStakeInfo(RID);
+    out.textContent = JSON.stringify(info, null, 2);
   } catch (e) {
+    console.error(e);
     out.textContent = 'ERR: ' + e;
   }
 }
-
-// автолок по таймеру
-setInterval(() => {
-  if (!PASS) return;
-  if (Date.now() - lastActivity > AUTOLOCK_MS) {
-    lockNow();
-  }
-}, 30_000);
 
 // -------------------- BOOT --------------------
 
@@ -236,6 +257,10 @@ setInterval(() => {
   try {
     ensureEnv();
 
+    const ep = $('#endpoint');
+    if (ep) ep.textContent = API;
+
+    // достаём зашифрованный приватник + мета
     META = await idbGet('acct:' + RID);
     if (!META) {
       throw new Error('локальная запись аккаунта не найдена');
@@ -249,9 +274,8 @@ setInterval(() => {
       pkcs8,
       { name: 'Ed25519' },
       false,
-      ['sign']
+      ['sign'],
     );
-
     KEYS = { privateKey };
 
     // показать RID + PUB (hex)
@@ -264,10 +288,10 @@ setInterval(() => {
     const rb = $('#rid-balance');
     if (rb) rb.value = RID;
 
-    const ep = $('#endpoint');
-    if (ep) ep.textContent = API;
+    const rb2 = $('#rid-bridge');
+    if (rb2) rb2.value = RID;
 
-    // спрятать ручной nonce и кнопку "получить nonce"
+    // спрятать ручной nonce и кнопку "Получить nonce"
     const nonceInput = $('#nonce');
     if (nonceInput && nonceInput.parentElement) {
       nonceInput.parentElement.style.display = 'none';
@@ -298,7 +322,7 @@ if (btnLock) {
   });
 }
 
-// показать баланс
+// баланс
 const btnBalance = $('#btn-balance');
 if (btnBalance) {
   btnBalance.addEventListener('click', () => {
@@ -307,7 +331,27 @@ if (btnBalance) {
   });
 }
 
-// отправка платежа (nonce берём автоматически)
+// ручное обновление nonce (оставим для совместимости, но прячем в UI)
+const btnNonce = $('#btn-nonce');
+if (btnNonce) {
+  btnNonce.addEventListener('click', async () => {
+    bumpActivity();
+    const out = $('#out-balance');
+    try {
+      const nonce = await getNonce(RID);
+      const nonceInput = $('#nonce');
+      if (nonceInput) {
+        nonceInput.value = String(nonce);
+      }
+      if (out) out.textContent = `nonce = ${nonce}`;
+    } catch (e) {
+      console.error(e);
+      if (out) out.textContent = 'ERR: ' + e;
+    }
+  });
+}
+
+// отправка платежа (nonce берём автоматически с ноды)
 const btnSend = $('#btn-send');
 if (btnSend) {
   btnSend.addEventListener('click', async () => {
@@ -315,9 +359,15 @@ if (btnSend) {
     try {
       bumpActivity();
 
+      if (!RID || !KEYS) {
+        throw new Error('Сначала войди / разблокируй кошелёк');
+      }
+
       const toInput = $('#to');
       const amountInput = $('#amount');
-      if (!toInput || !amountInput) throw new Error('нет полей получателя/суммы');
+      if (!toInput || !amountInput) {
+        throw new Error('нет полей получателя/суммы');
+      }
 
       const to = toInput.value.trim();
       const amountStr = amountInput.value.trim();
@@ -328,85 +378,61 @@ if (btnSend) {
         throw new Error('сумма должна быть > 0');
       }
 
-      // 1) актуальный nonce с ноды
+      // 1) актуальный nonce с ноды (возвращает последний, берём +1)
       const currentNonce = await getNonce(RID);
       const nonce = currentNonce + 1;
 
-      // 2) канонический байтстрим + подпись
-      const ch  = await canonHex(RID, to, amount, nonce);
-      const sig = await signCanon(ch);
+      const nonceInput = $('#nonce');
+      if (nonceInput) {
+        nonceInput.value = String(nonce);
+      }
 
-      // 3) отправляем батч (одна транзакция)
-      const btnSend = $('#btn-send');
-if (btnSend) btnSend.addEventListener('click', async () => {
-  bumpActivity();
-  if (!RID || !KEYS) {
-    alert('Сначала войди / разблокируй кошелёк');
-    return;
-  }
+      // 2) канонический hex
+      const ch = await canonHex(RID, to, amount, nonce);
 
-  const to   = $('#rid-send')?.value.trim();
-  const amtS = $('#amount')?.value || '';
-  const out  = $('#out-send');
+      // 3) подпись
+      const sigHex = await signCanon(ch);
 
-  try {
-    if (!to) throw new Error('Нужен RID получателя');
+      // 4) отправляем батч (одна транзакция)
+      const batch = [{
+        from: RID,
+        to,
+        amount,
+        nonce,
+        sig_hex: sigHex,
+      }];
 
-    const amount = BigInt(amtS || '0');
-    if (amount <= 0n) throw new Error('Сумма должна быть > 0');
+      const res = await submitBatch(batch);
 
-    // --- АВТО‑NONCE ---
-    const onChainNonce = await getNonce(RID);  // /balance/:rid → nonce
-    const nonce        = BigInt(onChainNonce + 1); // следующий nonce
+      if (out) {
+        out.textContent = JSON.stringify(res, null, 2);
+      }
+      await refreshBalance();
+    } catch (e) {
+      console.error('send error', e);
+      if (out) out.textContent = 'ERR: ' + e;
+      else alert('ERR: ' + e);
+    }
+  });
+}
 
-    // на всякий — подставим в инпут, но он будет скрыт
-    const nonceInput = $('#nonce');
-    if (nonceInput) nonceInput.value = nonce.toString();
+// стейкинг
 
-    const canon = await canonHex({
-      from:   RID,
-      to,
-      amount: amount.toString(),
-      nonce:  nonce.toString(),
-    });
-
-    const sigHex = await signCanon(canon);
-    const batch  = [{
-      from:   RID,
-      to,
-      amount: amount.toString(),
-      nonce:  nonce.toString(),
-      sig_hex: sigHex,
-    }];
-
-    const res = await submitBatch(batch);
-    if (out) out.textContent = JSON.stringify(res, null, 2);
-
-    await refreshBalance();
-  } catch (e) {
-    console.error(e);
-    if (out) out.textContent = 'ERR: ' + e;
-  }
-});
-
-// -------- STAKING --------
-
-// обновить статус стейкинга (если есть кнопка)
-const btnStakeStatus = $('#btn-stake-status');
-if (btnStakeStatus) {
-  btnStakeStatus.addEventListener('click', () => {
+const btnStakeRefresh = $('#btn-stake-refresh');
+if (btnStakeRefresh) {
+  btnStakeRefresh.addEventListener('click', async () => {
     bumpActivity();
-    refreshStake();
+    await refreshStake();
   });
 }
 
 const btnStakeDelegate = $('#btn-stake-delegate');
 if (btnStakeDelegate) {
   btnStakeDelegate.addEventListener('click', async () => {
-    const out = $('#out-stake-op');
+    const out = $('#out-stake');
     try {
       bumpActivity();
-      const inp = $('#stake-delegate-amount');
+      const inp = $('#stake-amount');
       const val = Number((inp && inp.value) || '0');
       if (!Number.isFinite(val) || val <= 0) throw new Error('сумма должна быть > 0');
       const res = await stakeDelegate(val);
@@ -414,19 +440,19 @@ if (btnStakeDelegate) {
       await refreshStake();
       await refreshBalance();
     } catch (e) {
+      console.error(e);
       if (out) out.textContent = 'ERR: ' + e;
-      else alert('ERR: ' + e);
     }
   });
-});
+}
 
 const btnStakeUndel = $('#btn-stake-undelegate');
 if (btnStakeUndel) {
   btnStakeUndel.addEventListener('click', async () => {
-    const out = $('#out-stake-op');
+    const out = $('#out-stake');
     try {
       bumpActivity();
-      const inp = $('#stake-undelegate-amount');
+      const inp = $('#unstake-amount');
       const val = Number((inp && inp.value) || '0');
       if (!Number.isFinite(val) || val <= 0) throw new Error('сумма должна быть > 0');
       const res = await stakeUndelegate(val);
@@ -434,16 +460,16 @@ if (btnStakeUndel) {
       await refreshStake();
       await refreshBalance();
     } catch (e) {
+      console.error(e);
       if (out) out.textContent = 'ERR: ' + e;
-      else alert('ERR: ' + e);
     }
   });
-});
+}
 
 const btnStakeClaim = $('#btn-stake-claim');
 if (btnStakeClaim) {
   btnStakeClaim.addEventListener('click', async () => {
-    const out = $('#out-stake-op');
+    const out = $('#out-stake');
     try {
       bumpActivity();
       const res = await stakeClaim();
@@ -451,174 +477,44 @@ if (btnStakeClaim) {
       await refreshStake();
       await refreshBalance();
     } catch (e) {
+      console.error(e);
       if (out) out.textContent = 'ERR: ' + e;
-      else alert('ERR: ' + e);
     }
   });
-});
+}
 
-// ===== LOGOS PATCH: /debug_canon + авто‑nonce ===============================
-(async function () {
-  const API = (window.API || (location.origin.replace(/\/$/, '') + '/api'));
-  const $   = (sel) => document.querySelector(sel);
-
-  // Берём глобальный RID, который уже показывает кошелёк
-  function getFromRid() {
-    if (window.RID && typeof window.RID === 'string') return window.RID.trim();
-    const ta = document.querySelector('textarea');
-    if (ta && ta.value.includes('RID:')) {
-      // в верхнем блоке RID: xxxx\nPUB (hex): yyyy
-      const m = ta.value.match(/RID:\s*([A-Za-z0-9]+)/);
-      if (m) return m[1];
-    }
-    return '';
-  }
-
-  async function fetchNonce(rid) {
-    const resp = await fetch(`${API}/balance/${encodeURIComponent(rid)}`, {
-      method: 'GET',
-      credentials: 'same-origin',
-      cache: 'no-store',
-    });
-    if (!resp.ok) throw new Error(`/balance ${resp.status}`);
-    const j = await resp.json();
-    return (j && typeof j.nonce === 'number') ? j.nonce : 0;
-  }
-
-  // Новый helper, который будем вызывать из старого кода
-  async function logosDebugCanonPatched(txLike) {
-    const from = (txLike.from || getFromRid() || '').trim();
-    const to   = (txLike.to   || txLike.rid_to || '').trim();
-    const amt  = Number(txLike.amount || txLike.lgn || 0);
-
-    if (!from || !to || !Number.isFinite(amt)) {
-      throw new Error('bad tx params (from/to/amount)');
-    }
-
-    const nonce = await fetchNonce(from);
-
-    const body = {
-      from,
-      to,
-      amount: amt,
-      nonce,
-    };
-
-    const resp = await fetch(`${API}/debug_canon`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
-      body: JSON.stringify(body),
-    });
-
-    if (!resp.ok) {
-      throw new Error(`/debug_canon ${resp.status}`);
-    }
-
-    // если фронт ожидает какое‑то тело — отдаём как есть
+// мост deposit rLGN (demo)
+const btnDeposit = $('#btn-deposit');
+if (btnDeposit) {
+  btnDeposit.addEventListener('click', async () => {
+    const out = $('#out-bridge');
     try {
-      return await resp.json();
-    } catch (_) {
-      return { ok: true };
-    }
-  }
+      bumpActivity();
+      const rid = ($('#rid-bridge') && $('#rid-bridge').value || RID || '').trim();
+      const amountStr = ($('#amount-bridge') && $('#amount-bridge').value) || '0';
+      const ext = ($('#ext') && $('#ext').value) || '';
 
-  // Подменяем глобальную функцию, если она есть,
-  // либо вешаем нашу на window, а старый код может её вызвать.
-  window.logosDebugCanon = logosDebugCanonPatched;
-})();
-
-// авто‑показ nonce в форме отправки (опционально)
-(function () {
-  const API = (window.API || (location.origin.replace(/\/$/, '') + '/api'));
-  const $   = (sel) => document.querySelector(sel);
-
-  async function fillNonceField() {
-    const from = (window.RID || '').trim();
-    const nonceInput = $('input[placeholder="Nonce"]') || $('input[name="nonce"]');
-    if (!from || !nonceInput) return;
-
-    try {
-      const r = await fetch(`${API}/balance/${encodeURIComponent(from)}`);
-      if (!r.ok) return;
-      const j = await r.json();
-      if (typeof j.nonce === 'number') {
-        nonceInput.value = String(j.nonce);
-        nonceInput.readOnly = true;
+      if (!rid) throw new Error('RID пустой');
+      const amount = Number(amountStr);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        throw new Error('сумма должна быть > 0');
       }
-    } catch (_) {}
-  }
 
-  window.addEventListener('load', fillNonceField);
-})();
-
-// ===== LOGOS PATCH: /debug_canon + авто‑nonce ===============================
-(async function () {
-  const API = (window.API || (location.origin.replace(/\/$/, '') + '/api'));
-  const $   = (sel) => document.querySelector(sel);
-
-  // Берём глобальный RID, который уже показывает кошелёк
-  function getFromRid() {
-    if (window.RID && typeof window.RID === 'string') return window.RID.trim();
-    const ta = document.querySelector('textarea');
-    if (ta && ta.value.includes('RID:')) {
-      // в верхнем блоке RID: xxxx\nPUB (hex): yyyy
-      const m = ta.value.match(/RID:\s*([A-Za-z0-9]+)/);
-      if (m) return m[1];
+      const res = await bridgeDeposit(rid, amount, ext);
+      if (out) out.textContent = JSON.stringify(res, null, 2);
+    } catch (e) {
+      console.error(e);
+      if (out) out.textContent = 'ERR: ' + e;
     }
-    return '';
+  });
+}
+
+// -------------------- AUTOLOCK TIMER --------------------
+
+setInterval(() => {
+  const now = Date.now();
+  if (now - lastActivity > AUTOLOCK_MS) {
+    console.log('autolock by inactivity');
+    lockNow();
   }
-
-  async function fetchNonce(rid) {
-    const resp = await fetch(`${API}/balance/${encodeURIComponent(rid)}`, {
-      method: 'GET',
-      credentials: 'same-origin',
-      cache: 'no-store',
-    });
-    if (!resp.ok) throw new Error(`/balance ${resp.status}`);
-    const j = await resp.json();
-    return (j && typeof j.nonce === 'number') ? j.nonce : 0;
-  }
-
-  // Новый helper, который будем вызывать из старого кода
-  async function logosDebugCanonPatched(txLike) {
-    const from = (txLike.from || getFromRid() || '').trim();
-    const to   = (txLike.to   || txLike.rid_to || '').trim();
-    const amt  = Number(txLike.amount || txLike.lgn || 0);
-
-    if (!from || !to || !Number.isFinite(amt)) {
-      throw new Error('bad tx params (from/to/amount)');
-    }
-
-    const nonce = await fetchNonce(from);
-
-    const body = {
-      from,
-      to,
-      amount: amt,
-      nonce,
-    };
-
-    const resp = await fetch(`${API}/debug_canon`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
-      body: JSON.stringify(body),
-    });
-
-    if (!resp.ok) {
-      throw new Error(`/debug_canon ${resp.status}`);
-    }
-
-    // если фронт ожидает какое‑то тело — отдаём как есть
-    try {
-      return await resp.json();
-    } catch (_) {
-      return { ok: true };
-    }
-  }
-
-  // Подменяем глобальную функцию, если она есть,
-  // либо вешаем нашу на window, а старый код может её вызвать.
-  window.logosDebugCanon = logosDebugCanonPatched;
-})();
+}, 30_000);

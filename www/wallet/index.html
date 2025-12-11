@@ -1,4 +1,108 @@
-<!doctype html><meta charset="utf-8">
-<title>Redirecting…</title>
-<meta http-equiv="refresh" content="0; url=./login.html">
-<a href="./login.html">Перейти в LOGOS Wallet</a>
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LOGOS Wallet — Кошелёк</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0b0c10;color:#e6edf3}
+    header{padding:16px 20px;background:#11151a;border-bottom:1px solid #1e242c;position:sticky;top:0}
+    h1{font-size:18px;margin:0}
+    main{max-width:1024px;margin:24px auto;padding:0 16px}
+    section{background:#11151a;margin:16px 0;border-radius:12px;padding:16px;border:1px solid #1e242c}
+    label{display:block;margin:8px 0 6px}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    input,textarea,button{font:inherit}
+    input,textarea{width:100%;box-sizing:border-box;border-radius:8px;border:1px solid #303741;background:#0b0c10;color:#e6edf3;padding:8px 10px}
+    textarea{min-height:80px;resize:vertical}
+    button{border-radius:8px;border:none;background:#2563eb;color:#e6edf3;padding:10px 14px;cursor:pointer;font-weight:500}
+    button:disabled{opacity:.6;cursor:not-allowed}
+    pre{white-space:pre-wrap;word-break:break-all;font-size:12px}
+    .mono{font-family:ui-monospace,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
+    .row{display:flex;gap:12px;align-items:center;justify-content:space-between}
+    .row>div{flex:1}
+    small{color:#8b949e}
+  </style>
+</head>
+<body>
+<header>
+  <h1>LOGOS Wallet — Кошелёк</h1>
+  <div class="mono" style="font-size:11px;margin-top:4px">
+    Endpoint: <span id="endpoint-span">https://mw-expedition.com/api</span>
+  </div>
+</header>
+
+<main>
+  <section>
+    <h3>Твой RID / Публичный ключ</h3>
+    <div class="grid">
+      <div>
+        <label>RID / PUB (hex)</label>
+        <textarea id="pub" class="mono" readonly></textarea>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <div class="row">
+          <button id="btn-lock">Выйти (заблокировать)</button>
+          <button id="btn-nonce">Получить nonce</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h3>Баланс</h3>
+    <div class="grid">
+      <div>
+        <label>RID</label>
+        <input id="rid-balance" class="mono"/>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <button id="btn-balance">Показать баланс</button>
+      </div>
+    </div>
+    <pre id="out-balance" class="mono" style="margin-top:12px"></pre>
+  </section>
+
+  <section>
+    <h3>Подпись и отправка (batch)</h3>
+    <div class="grid">
+      <div>
+        <label>Получатель (RID)</label>
+        <input id="to" class="mono" placeholder="RID получателя"/>
+      </div>
+      <div>
+        <label>Сумма (LGN)</label>
+        <input id="amount" type="number" min="0" step="1" value="1"/>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:12px">
+      <div>
+        <label>Nonce</label>
+        <input id="nonce" class="mono" placeholder="нажми «Получить nonce»"/>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <button id="btn-send">Подписать и отправить</button>
+      </div>
+    </div>
+
+    <pre id="out-send" class="mono" style="margin-top:12px"></pre>
+  </section>
+
+  <section>
+    <h3>Мост rToken (депозит, демо)</h3>
+    <div class="grid">
+      <div><label>ext_txid</label><input id="ext" class="mono" placeholder="например eth_txid_0xabc"/></div>
+      <div><label>&nbsp;</label><button id="btn-deposit">Deposit rLGN</button></div>
+    </div>
+    <pre id="out-bridge" class="mono" style="margin-top:12px"></pre>
+  </section>
+</main>
+
+<script src="./app.js?v=20250906_01" defer></script>
+<script src="./compat.js?v=20251207_01" defer></script>
+</body>
+</html>
