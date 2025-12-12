@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta http-equiv="Cache-Control" content="no-store"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LOGOS Wallet — Secure</title>
+  <link rel="stylesheet" href="/shared/wallet-theme.css?v=20251212_04"/>
+  <link rel="stylesheet" href="./auth.css?v=20251212_04"/>
+</head>
+<body class="logos-ui">
+  <header class="topbar">
+    <div class="topbar__inner">
+      <div class="brand">
+        <div class="brand__mark"><span>LRB</span></div>
+        <div>
+          <div class="brand__title">LOGOS Wallet</div>
+          <div class="brand__sub">Local keys · AES‑GCM + PBKDF2 · Ed25519 via tweetnacl</div>
+        </div>
+      </div>
+      <div class="topbar__right">
+        <div class="pill">HTTPS only</div>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="card hero">
+      <h1>Доступ к кошельку</h1>
+      <p class="muted">Ключи живут локально в браузере. Сервер получает только подписанные операции.</p>
+    </section>
+
+    <div class="grid-2">
+      <section class="card">
+        <header class="card__head">
+          <h2>Вход</h2>
+          <p class="muted">Если RID уже есть на этом устройстве — вход по паролю.</p>
+        </header>
+
+        <label for="loginRid">RID</label>
+        <input id="loginRid" class="mono" placeholder="RID (base58) или выбери ниже" autocomplete="off"/>
+
+        <label for="loginPass">Пароль</label>
+        <input id="loginPass" type="password" placeholder="Пароль, которым шифровали ключ" autocomplete="current-password"/>
+
+        <div class="row">
+          <button id="btn-login" class="primary" type="button">Войти по RID + пароль</button>
+          <button id="btn-list" type="button">Показать сохранённые RID</button>
+        </div>
+
+        <div id="listWrap" hidden>
+          <div class="muted">Локально сохранённые RID (кликни, чтобы подставить):</div>
+          <ul id="ridList"></ul>
+        </div>
+      </section>
+
+      <section class="card">
+        <header class="card__head">
+          <h2>Создать новый</h2>
+          <p class="muted">Ключ генерируется в браузере. Запиши 16 слов — это единственный способ восстановления.</p>
+        </header>
+
+        <label for="createPass">Новый пароль</label>
+        <input id="createPass" type="password" placeholder="Минимум 10 символов, буквы + цифры" autocomplete="new-password"/>
+
+        <div class="row">
+          <button id="btn-create" class="primary" type="button">Создать новый RID + фразу</button>
+        </div>
+
+        <div id="mnemonicSection" hidden>
+          <h3>Резервная фраза (16 слов)</h3>
+
+          <label for="mnemonicShow">Фраза (только чтение)</label>
+          <textarea id="mnemonicShow" class="mono" readonly spellcheck="false"></textarea>
+
+          <label for="mnemonicConfirm">Повтори фразу для проверки ещё раз</label>
+          <textarea id="mnemonicConfirm" class="mono" placeholder="введите те же 16 слов через пробел" spellcheck="false"></textarea>
+
+          <div class="row">
+            <button id="btn-mnemonic-ok" class="primary" type="button">Я записал фразу, перейти в кошелёк</button>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <section class="card">
+      <header class="card__head">
+        <h2>Восстановить по фразе</h2>
+        <p class="muted">Вводишь 16 слов и задаёшь новый пароль. RID восстановится автоматически.</p>
+      </header>
+
+      <label for="restoreMnemonic">Резервная фраза (16 слов)</label>
+      <textarea id="restoreMnemonic" class="mono" placeholder="16 слов через пробел" spellcheck="false"></textarea>
+
+      <label for="restorePass">Новый пароль</label>
+      <input id="restorePass" type="password" placeholder="Минимум 10 символов, буквы + цифры" autocomplete="new-password"/>
+
+      <div class="row">
+        <button id="btn-restore" class="primary" type="button">Восстановить кошелёк</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <header class="card__head">
+        <h2>Сервис</h2>
+        <p class="muted">Сброс локальных аккаунтов доступен только на localhost (dev).</p>
+      </header>
+      <div class="row">
+        <button id="btn-reset" class="danger" type="button" hidden>Сбросить локальные аккаунты (DEV)</button>
+      </div>
+      <pre id="out" class="mono">Статус: жду действий…</pre>
+    </section>
+  </main>
+
+  <script src="/shared/tweetnacl.min.js?v=20251212_04" defer></script>
+  <script src="./auth.js?v=20251212_04" defer></script>
+</body>
+</html>

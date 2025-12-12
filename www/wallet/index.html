@@ -1,108 +1,193 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>LOGOS Wallet — Кошелёк</title>
-  <style>
-    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0b0c10;color:#e6edf3}
-    header{padding:16px 20px;background:#11151a;border-bottom:1px solid #1e242c;position:sticky;top:0}
-    h1{font-size:18px;margin:0}
-    main{max-width:1024px;margin:24px auto;padding:0 16px}
-    section{background:#11151a;margin:16px 0;border-radius:12px;padding:16px;border:1px solid #1e242c}
-    label{display:block;margin:8px 0 6px}
-    .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-    input,textarea,button{font:inherit}
-    input,textarea{width:100%;box-sizing:border-box;border-radius:8px;border:1px solid #303741;background:#0b0c10;color:#e6edf3;padding:8px 10px}
-    textarea{min-height:80px;resize:vertical}
-    button{border-radius:8px;border:none;background:#2563eb;color:#e6edf3;padding:10px 14px;cursor:pointer;font-weight:500}
-    button:disabled{opacity:.6;cursor:not-allowed}
-    pre{white-space:pre-wrap;word-break:break-all;font-size:12px}
-    .mono{font-family:ui-monospace,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
-    .row{display:flex;gap:12px;align-items:center;justify-content:space-between}
-    .row>div{flex:1}
-    small{color:#8b949e}
-  </style>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="color-scheme" content="dark"/>
+  <link rel="stylesheet" href="./wallet.css?v=30"/>
 </head>
 <body>
-<header>
-  <h1>LOGOS Wallet — Кошелёк</h1>
-  <div class="mono" style="font-size:11px;margin-top:4px">
-    Endpoint: <span id="endpoint-span">https://mw-expedition.com/api</span>
-  </div>
-</header>
-
-<main>
-  <section>
-    <h3>Твой RID / Публичный ключ</h3>
-    <div class="grid">
-      <div>
-        <label>RID / PUB (hex)</label>
-        <textarea id="pub" class="mono" readonly></textarea>
+  <!-- Верхняя панель -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="logo-dot"></div>
+      <div class="topbar-title">
+        <span class="brand">LOGOS</span>
+        <span class="product">Wallet</span>
       </div>
+    </div>
+    <div class="topbar-right">
+      <span class="endpoint-label">Endpoint</span>
+      <span class="endpoint-value" id="endpoint"></span>
+      <button id="btn-lock" class="chip chip-ghost">Выйти</button>
+    </div>
+  </header>
+
+  <main class="page-shell">
+    <header class="page-header">
       <div>
-        <label>&nbsp;</label>
-        <div class="row">
-          <button id="btn-lock">Выйти (заблокировать)</button>
-          <button id="btn-nonce">Получить nonce</button>
+        <h1>LOGOS Wallet — Кошелёк</h1>
+        <p class="subtitle">
+          Non‑custodial кошелёк: ключи и подписи живут только в этом браузере.
+          Никакого серверного хранилища.
+        </p>
+      </div>
+    </header>
+
+    <!-- RID / PUB -->
+    <section class="card">
+      <header class="card-header">
+        <div>
+          <h2 class="card-title">Твой RID / Публичный ключ</h2>
+          <p class="card-caption">
+            RID — адрес аккаунта в сети LOGOS. Публичный ключ (hex) используется для проверки подписи.
+          </p>
+        </div>
+      </header>
+      <div class="card-body">
+        <textarea id="pub" class="mono-field" readonly></textarea>
+        <p class="hint">
+          Ключи живут только в памяти этой вкладки. После выхода или закрытия
+          вкладки для доступа к кошельку снова нужен пароль.
+        </p>
+      </div>
+    </section>
+
+    <!-- Баланс -->
+    <section class="card">
+      <header class="card-header">
+        <div>
+          <h2 class="card-title">Баланс</h2>
+          <p class="card-caption">
+            Проверка баланса и nonce для выбранного RID.
+          </p>
+        </div>
+      </header>
+      <div class="card-body">
+        <label class="field">
+          <span class="field-label">RID</span>
+          <input id="rid-balance" type="text" class="field-input" placeholder="RID"/>
+        </label>
+
+        <div class="actions-row">
+          <button id="btn-balance" class="btn primary">Показать баланс</button>
+        </div>
+
+        <pre id="out-balance" class="mono-output"></pre>
+      </div>
+    </section>
+
+    <!-- Подпись и отправка -->
+    <section class="card">
+      <header class="card-header">
+        <div>
+          <h2 class="card-title">Подпись и отправка (batch)</h2>
+          <p class="card-caption">
+            Подписанная Ed25519 транзакция отправляется в ноду как батч (одна транзакция).
+          </p>
+        </div>
+      </header>
+      <div class="card-body">
+        <label class="field">
+          <span class="field-label">Получатель (RID)</span>
+          <input id="to" type="text" class="field-input" placeholder="RID получателя"/>
+        </label>
+
+        <div class="field-row">
+          <label class="field grow">
+            <span class="field-label">Сумма (LGN)</span>
+            <input id="amount" type="number" min="0" step="1" class="field-input"/>
+          </label>
+
+          <label class="field field-nonce">
+            <span class="field-label">Nonce (debug)</span>
+            <input id="nonce" type="number" class="field-input"/>
+          </label>
+        </div>
+
+        <div class="actions-row">
+          <button id="btn-send" class="btn primary">Подписать и отправить</button>
+          <button id="btn-nonce" class="btn ghost">Получить nonce</button>
+        </div>
+
+        <pre id="out-send" class="mono-output"></pre>
+      </div>
+    </section>
+
+    <!-- Стейкинг -->
+    <section class="card">
+      <header class="card-header">
+        <div>
+          <h2 class="card-title">Стейкинг (delegate / undelegate / claim)</h2>
+          <p class="card-caption">
+            Управление стейкингом текущего RID: делегирование, раз‑делегирование и заявка наград.
+          </p>
+        </div>
+        <button id="btn-stake-refresh" class="chip chip-ghost">Обновить статус</button>
+      </header>
+      <div class="card-body">
+        <pre id="out-stake" class="mono-output"></pre>
+
+        <div class="field-row">
+          <label class="field grow">
+            <span class="field-label">Застейкать (delegate, LGN)</span>
+            <input id="stake-amount" type="number" min="0" step="1" class="field-input"/>
+          </label>
+          <button id="btn-stake-delegate" class="btn primary">Делегировать</button>
+        </div>
+
+        <div class="field-row">
+          <label class="field grow">
+            <span class="field-label">Разстейкать (undelegate, LGN)</span>
+            <input id="unstake-amount" type="number" min="0" step="1" class="field-input"/>
+          </label>
+          <button id="btn-stake-undelegate" class="btn ghost">Разстейкать</button>
+        </div>
+
+        <div class="actions-row">
+          <button id="btn-stake-claim" class="btn secondary">Заявить награду (claim)</button>
         </div>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <section>
-    <h3>Баланс</h3>
-    <div class="grid">
-      <div>
-        <label>RID</label>
-        <input id="rid-balance" class="mono"/>
-      </div>
-      <div>
-        <label>&nbsp;</label>
-        <button id="btn-balance">Показать баланс</button>
-      </div>
-    </div>
-    <pre id="out-balance" class="mono" style="margin-top:12px"></pre>
-  </section>
+    <!-- Мост rToken -->
+    <section class="card">
+      <header class="card-header">
+        <div>
+          <h2 class="card-title">Мост rToken (депозит, demo)</h2>
+          <p class="card-caption">
+            Демонстрационный депозит rLGN через внешний txid.
+          </p>
+        </div>
+      </header>
+      <div class="card-body">
+        <label class="field">
+          <span class="field-label">RID</span>
+          <input id="rid-bridge" type="text" class="field-input" placeholder="RID для депозита rLGN"/>
+        </label>
 
-  <section>
-    <h3>Подпись и отправка (batch)</h3>
-    <div class="grid">
-      <div>
-        <label>Получатель (RID)</label>
-        <input id="to" class="mono" placeholder="RID получателя"/>
-      </div>
-      <div>
-        <label>Сумма (LGN)</label>
-        <input id="amount" type="number" min="0" step="1" value="1"/>
-      </div>
-    </div>
+        <div class="field-row">
+          <label class="field grow">
+            <span class="field-label">Сумма (rLGN)</span>
+            <input id="amount-bridge" type="number" min="0" step="1" class="field-input"/>
+          </label>
 
-    <div class="grid" style="margin-top:12px">
-      <div>
-        <label>Nonce</label>
-        <input id="nonce" class="mono" placeholder="нажми «Получить nonce»"/>
+          <label class="field grow">
+            <span class="field-label">ext_txid (например eth_txid_0xabc)</span>
+            <input id="ext" type="text" class="field-input"/>
+          </label>
+        </div>
+
+        <div class="actions-row">
+          <button id="btn-deposit" class="btn primary">Deposit rLGN (demo)</button>
+        </div>
+
+        <pre id="out-bridge" class="mono-output"></pre>
       </div>
-      <div>
-        <label>&nbsp;</label>
-        <button id="btn-send">Подписать и отправить</button>
-      </div>
-    </div>
+    </section>
+  </main>
 
-    <pre id="out-send" class="mono" style="margin-top:12px"></pre>
-  </section>
-
-  <section>
-    <h3>Мост rToken (депозит, демо)</h3>
-    <div class="grid">
-      <div><label>ext_txid</label><input id="ext" class="mono" placeholder="например eth_txid_0xabc"/></div>
-      <div><label>&nbsp;</label><button id="btn-deposit">Deposit rLGN</button></div>
-    </div>
-    <pre id="out-bridge" class="mono" style="margin-top:12px"></pre>
-  </section>
-</main>
-
-<script src="./app.js?v=20250906_01" defer></script>
-<script src="./compat.js?v=20251207_01" defer></script>
+  <script src="./app.js?v=1" defer></script>
 </body>
 </html>

@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta http-equiv="Cache-Control" content="no-store"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LOGOS Wallet — Secure (WebCrypto + IndexedDB + 16 слов)</title>
+
+  <link rel="stylesheet" href="/shared/wallet-theme.css"/>
+  <link rel="stylesheet" href="./auth.css"/>
+
+  <script src="/shared/i18n.js" defer></script>
+  <script src="/shared/tweetnacl.min.js" defer></script>
+  <script src="./auth.js?v=20251212_01" defer></script>
+</head>
+<body>
+  <div id="logos-lang"></div>
+
+  <header class="topbar">
+    <div>
+      <div class="brand">LOGOS Wallet</div>
+      <div class="muted small mono">Secure (AES-GCM + PBKDF2) • Ed25519 via tweetnacl</div>
+    </div>
+  </header>
+
+  <main class="container">
+    <h1>LOGOS Wallet — Secure (WebCrypto + IndexedDB + 16 слов)</h1>
+
+    <section class="card">
+      <h3>Вход в существующий кошелёк</h3>
+
+      <label for="loginRid">RID</label>
+      <input id="loginRid" class="mono" placeholder="RID (base58) или выбери ниже"/>
+
+      <label for="loginPass">Пароль</label>
+      <input id="loginPass" type="password" placeholder="Пароль, которым шифровали ключ"/>
+
+      <div class="row">
+        <button id="btn-login" type="button">Войти по RID + пароль</button>
+        <button id="btn-list" type="button" class="secondary">Показать сохранённые RID</button>
+      </div>
+
+      <div id="listWrap" class="hidden">
+        <div class="muted">Локально сохранённые RID (кликни, чтобы подставить):</div>
+        <ul id="ridList" class="ridList"></ul>
+      </div>
+    </section>
+
+    <section class="card">
+      <h3>Создать новый кошелёк</h3>
+      <p class="muted">
+        Ключ генерируется в браузере, приватник шифруется паролем (PBKDF2 + AES‑GCM).
+        После создания будет показана резервная фраза из 16 слов — запиши и храни её.
+      </p>
+
+      <label for="createPass">Новый пароль</label>
+      <input id="createPass" type="password" placeholder="Минимум 10 символов, буквы + цифры"/>
+
+      <div class="row">
+        <button id="btn-create" type="button">Создать новый RID + фразу</button>
+      </div>
+
+      <section id="mnemonicSection" class="nested hidden">
+        <h3>Резервная фраза (16 слов)</h3>
+        <p class="muted">
+          Запиши фразу на бумагу и храни в безопасном месте.
+          Это единственный способ восстановить кошелёк на новом устройстве.
+        </p>
+
+        <label for="mnemonicShow">Фраза (только чтение)</label>
+        <textarea id="mnemonicShow" class="mono" readonly></textarea>
+
+        <label for="mnemonicConfirm">Повтори фразу для проверки ещё раз</label>
+        <input id="mnemonicConfirm" class="mono" placeholder="введи те же 16 слов через пробел"/>
+
+        <div class="row">
+          <button id="btn-mnemonic-ok" type="button">Я записал фразу, перейти в кошелёк</button>
+        </div>
+      </section>
+    </section>
+
+    <section class="card">
+      <h3>Восстановить кошелёк по фразе</h3>
+      <p class="muted">
+        Если устройство потеряно/очищено — введи 16‑словную фразу и задай новый пароль.
+        Пароль можно поменять — фраза остаётся той же.
+      </p>
+
+      <label for="restoreMnemonic">Резервная фраза (16 слов)</label>
+      <textarea id="restoreMnemonic" class="mono" placeholder="16 слов через пробел"></textarea>
+
+      <label for="restorePass">Новый пароль</label>
+      <input id="restorePass" type="password" placeholder="Минимум 10 символов, буквы + цифры"/>
+
+      <div class="row">
+        <button id="btn-restore" type="button">Восстановить кошелёк</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h3>Сервис</h3>
+      <pre id="out" class="mono pre"></pre>
+    </section>
+  </main>
+</body>
+</html>

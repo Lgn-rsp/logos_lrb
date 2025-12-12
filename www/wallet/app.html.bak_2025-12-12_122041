@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta http-equiv="Cache-Control" content="no-store"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LOGOS Wallet</title>
+  <link rel="stylesheet" href="/shared/wallet-theme.css?v=20251212_01"/>
+  <link rel="stylesheet" href="./app.css?v=20251212_01"/>
+</head>
+<body class="logos-ui">
+  <header class="topbar">
+    <div class="topbar__inner">
+      <div class="brand">
+        <div class="brand__mark"><span>LRB</span></div>
+        <div class="brand__text">
+          <div class="brand__title">LOGOS Wallet</div>
+          <div class="brand__sub">Local keys · Signed in browser · API ready</div>
+        </div>
+      </div>
+      <div class="topbar__right">
+        <div class="pill">API: <span id="endpoint" class="mono">/api</span></div>
+        <button id="btn-lock" class="secondary">Выйти (лок)</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <div class="grid-2">
+      <section class="card">
+        <header class="card__head">
+          <h2>Ключи</h2>
+          <p class="muted">RID = base58(pubkey). Приватный ключ хранится локально (AES‑GCM + PBKDF2).</p>
+        </header>
+        <textarea id="pub" class="mono" readonly spellcheck="false"></textarea>
+      </section>
+
+      <section class="card">
+        <header class="card__head">
+          <h2>Баланс</h2>
+          <p class="muted">Проверка баланса и nonce по RID.</p>
+        </header>
+
+        <label for="rid-balance">RID</label>
+        <input id="rid-balance" class="mono" placeholder="RID (base58)" spellcheck="false"/>
+
+        <div class="actions">
+          <button id="btn-balance">Показать баланс</button>
+          <button id="btn-nonce" class="secondary">Обновить nonce</button>
+        </div>
+
+        <pre id="out-balance"></pre>
+      </section>
+    </div>
+
+    <section class="card">
+      <header class="card__head">
+        <h2>Отправить транзакцию</h2>
+        <p class="muted">Подпись делается локально, отправка — через API. Amount указывать в micro‑LGN.</p>
+      </header>
+
+      <div class="grid-3">
+        <div>
+          <label for="to">Кому (RID)</label>
+          <input id="to" class="mono" placeholder="RID получателя" spellcheck="false"/>
+        </div>
+        <div>
+          <label for="amount">Сумма (micro‑LGN)</label>
+          <input id="amount" inputmode="numeric" placeholder="например: 1000000"/>
+        </div>
+        <div>
+          <label for="nonce">Nonce (auto)</label>
+          <input id="nonce" inputmode="numeric" placeholder="nonce"/>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="btn-send">Подписать и отправить</button>
+      </div>
+
+      <pre id="out-send"></pre>
+    </section>
+
+    <section class="card">
+      <header class="card__head">
+        <h2>Стейкинг</h2>
+        <p class="muted">delegate / undelegate / claim. Работает через /stake/* совместимые обёртки.</p>
+      </header>
+
+      <div class="grid-2">
+        <div>
+          <label for="validator">Validator (RID)</label>
+          <input id="validator" class="mono" placeholder="RID валидатора" spellcheck="false"/>
+
+          <label for="stake-amount">Делегировать (micro‑LGN)</label>
+          <input id="stake-amount" inputmode="numeric" placeholder="например: 1000000"/>
+
+          <div class="actions">
+            <button id="btn-stake-delegate">Делегировать</button>
+          </div>
+        </div>
+
+        <div>
+          <label for="unstake-amount">Разстейкать (micro‑LGN)</label>
+          <input id="unstake-amount" inputmode="numeric" placeholder="например: 500000"/>
+
+          <div class="actions">
+            <button id="btn-stake-undelegate" class="secondary">Снять делегацию</button>
+            <button id="btn-stake-claim">Заявить награду</button>
+            <button id="btn-stake-refresh" class="secondary">Обновить</button>
+          </div>
+        </div>
+      </div>
+
+      <pre id="out-stake"></pre>
+
+      <details class="compat">
+        <summary>Compatibility controls (если нужен старый UI)</summary>
+        <div class="grid-2 compat__grid">
+          <div>
+            <label for="val">val (alt id)</label>
+            <input id="val" class="mono" placeholder="optional" spellcheck="false"/>
+            <div class="actions">
+              <button id="btn-delegate" class="secondary">delegate (legacy)</button>
+            </div>
+          </div>
+          <div>
+            <label for="amount-unstake">amount-unstake (alt id)</label>
+            <input id="amount-unstake" inputmode="numeric" placeholder="optional"/>
+            <div class="actions">
+              <button id="btn-undelegate" class="secondary">undelegate (legacy)</button>
+              <button id="btn-claim" class="secondary">claim (legacy)</button>
+              <button id="btn-my" class="secondary">my (legacy)</button>
+            </div>
+            <pre id="out-my"></pre>
+          </div>
+        </div>
+      </details>
+    </section>
+
+    <section class="card">
+      <header class="card__head">
+        <h2>Bridge</h2>
+        <p class="muted">ext_txid — идемпотентный ключ операции deposit.</p>
+      </header>
+
+      <div class="grid-2">
+        <div>
+          <label for="rid-bridge">RID</label>
+          <input id="rid-bridge" class="mono" placeholder="RID получателя" spellcheck="false"/>
+
+          <label for="amount-bridge">Amount (micro‑LGN)</label>
+          <input id="amount-bridge" inputmode="numeric" placeholder="например: 1000000"/>
+        </div>
+
+        <div>
+          <label for="ext">ext_txid</label>
+          <input id="ext" class="mono" placeholder="уникальный внешний txid" spellcheck="false"/>
+
+          <div class="actions">
+            <button id="btn-deposit">deposit</button>
+          </div>
+        </div>
+      </div>
+
+      <pre id="out-bridge"></pre>
+    </section>
+
+    <div class="footer">LOGOS Wallet • keys stay local • premium UI</div>
+  </main>
+
+  <script src="./app.js?v=20251212_01" defer></script>
+</body>
+</html>

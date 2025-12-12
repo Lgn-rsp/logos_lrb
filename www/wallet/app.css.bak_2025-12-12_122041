@@ -1,0 +1,17 @@
+/* app page tweaks (theme is in /shared/wallet-theme.css) */
+
+#pub{
+  min-height:120px;
+}
+
+#out-balance,#out-send,#out-stake,#out-bridge{
+  max-height:240px;
+}
+
+.compat{
+  margin-top:12px;
+}
+
+.compat__grid{
+  margin-top:12px;
+}

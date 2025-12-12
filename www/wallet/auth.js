@@ -1,70 +1,65 @@
-// AUTH v4: RID + пароль + 16-словная фраза восстановления.
-// Ключи только локально (IndexedDB + AES-GCM), приватник никогда не уходит в сеть.
+'use strict';
+
+// AUTH (mainnet-grade):
+// - AES-GCM + PBKDF2 (WebCrypto)
+// - Ed25519 via tweetnacl (НЕ зависит от WebCrypto Ed25519)
+// - хранение: IndexedDB, зашифрованный PKCS8 (RFC8410 prefix + seed32)
+// - CSP-safe: без inline handlers и без element.style
 
 const DB_NAME = 'logos_wallet_v2';
 const STORE   = 'keys';
 const enc     = new TextEncoder();
 const ALPH    = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 
-const $ = s => document.querySelector(s);
-const out = msg => { const el = $('#out'); if (el) el.textContent = String(msg); };
+const MN_WORDS = 16;
+const MN_ALPH  = 'abcdefghjkmnpqrstuvwxyz';
 
-function normRid(s) { return (s || '').replace(/\s+/g, '').trim(); }
+const ED25519_PKCS8_PREFIX = new Uint8Array([
+  0x30, 0x2e, 0x02, 0x01, 0x00,
+  0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
+  0x04, 0x22, 0x04, 0x20
+]);
+
+const $ = (s) => document.querySelector(s);
+const out = (msg) => { const el = $('#out'); if (el) el.textContent = String(msg); };
 
 function ensureEnv() {
   if (!window.isSecureContext) throw new Error('Нужен HTTPS (secure context)');
-  if (!window.indexedDB)      throw new Error('IndexedDB недоступен');
+  if (!window.indexedDB) throw new Error('IndexedDB недоступен');
   if (!window.crypto || !window.crypto.subtle) throw new Error('WebCrypto недоступен');
+  if (!window.nacl || !window.nacl.sign || !window.nacl.sign.keyPair || !window.nacl.sign.keyPair.fromSeed) {
+    throw new Error('tweetnacl не загружен (нет window.nacl)');
+  }
 }
 
-// IndexedDB helpers
-const idb = () => new Promise((res, rej) => {
-  const r = indexedDB.open(DB_NAME, 1);
-  r.onupgradeneeded = () => r.result.createObjectStore(STORE);
-  r.onsuccess = () => res(r.result);
-  r.onerror   = () => rej(r.error);
-});
-const idbGet = async k => {
-  const db = await idb();
-  return new Promise((res, rej) => {
-    const t = db.transaction(STORE, 'readonly').objectStore(STORE).get(k);
-    t.onsuccess = () => res(t.result || null);
-    t.onerror   = () => rej(t.error);
-  });
-};
-const idbSet = async (k, v) => {
-  const db = await idb();
-  return new Promise((res, rej) => {
-    const t = db.transaction(STORE, 'readwrite').objectStore(STORE).put(v, k);
-    t.onsuccess = () => res();
-    t.onerror   = () => rej(t.error);
-  });
-};
-const idbDel = async k => {
-  const db = await idb();
-  return new Promise((res, rej) => {
-    const t = db.transaction(STORE, 'readwrite').objectStore(STORE).delete(k);
-    t.onsuccess = () => res();
-    t.onerror   = () => rej(t.error);
-  });
-};
+function normRid(s) { return (s || '').replace(/\s+/g, '').trim(); }
+function normalizeMnemonic(s) { return (s || '').trim().toLowerCase().replace(/\s+/g, ' '); }
 
-// base58 для RID (как в ядре)
-const b58 = bytes => {
-  const h = [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, '0')).join('');
-  let x = BigInt('0x' + h), o = '';
-  while (x > 0n) { o = ALPH[Number(x % 58n)] + o; x /= 58n; }
-  return o || '1';
-};
+function b58encode(bytes) {
+  const src = (bytes instanceof Uint8Array) ? bytes : new Uint8Array(bytes || []);
+  if (src.length === 0) return '';
+  const digits = [0];
+  for (let i = 0; i < src.length; i++) {
+    let carry = src[i];
+    for (let j = 0; j < digits.length; j++) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry) {
+      digits.push(carry % 58);
+      carry = (carry / 58) | 0;
+    }
+  }
+  let out = '';
+  for (let k = 0; k < src.length && src[k] === 0; k++) out += ALPH[0];
+  for (let q = digits.length - 1; q >= 0; q--) out += ALPH[digits[q]];
+  return out;
+}
 
-// Password helpers
 function validateNewPassword(pass) {
-  if (!pass || pass.length < 10) {
-    throw new Error('Пароль ≥10 символов');
-  }
-  if (!/[A-Za-z]/.test(pass) || !/[0-9]/.test(pass)) {
-    throw new Error('Пароль должен содержать буквы и цифры');
-  }
+  if (!pass || pass.length < 10) throw new Error('Пароль ≥10 символов');
+  if (!/[A-Za-z]/.test(pass) || !/[0-9]/.test(pass)) throw new Error('Пароль должен содержать буквы и цифры');
   return pass;
 }
 function ensureLoginPassword(pass) {
@@ -72,41 +67,117 @@ function ensureLoginPassword(pass) {
   return pass;
 }
 
-// Crypto helpers
-async function deriveKey(pass, salt) {
-  const keyMat = await crypto.subtle.importKey(
-    'raw',
-    enc.encode(pass),
-    'PBKDF2',
-    false,
-    ['deriveKey']
-  );
+async function sha256Bytes(str) {
+  const digest = await crypto.subtle.digest('SHA-256', enc.encode(str));
+  return new Uint8Array(digest);
+}
+
+function randomWord(len = 5) {
+  const buf = new Uint8Array(len);
+  crypto.getRandomValues(buf);
+  let w = '';
+  for (let i = 0; i < len; i++) w += MN_ALPH[buf[i] % MN_ALPH.length];
+  return w;
+}
+function generateMnemonic() {
+  const words = [];
+  for (let i = 0; i < MN_WORDS; i++) words.push(randomWord());
+  return words.join(' ');
+}
+
+async function mnemonicToSeed(mnemonic) {
+  const norm = normalizeMnemonic(mnemonic);
+  if (!norm) throw new Error('Резервная фраза пуста');
+  return sha256Bytes('logos-lrb-ed25519:' + norm); // 32 bytes
+}
+
+function buildPkcs8FromSeed(seed32) {
+  if (!(seed32 instanceof Uint8Array) || seed32.length !== 32) throw new Error('seed должен быть 32 байта');
+  const out = new Uint8Array(ED25519_PKCS8_PREFIX.length + 32);
+  out.set(ED25519_PKCS8_PREFIX, 0);
+  out.set(seed32, ED25519_PKCS8_PREFIX.length);
+  return out;
+}
+
+function extractSeedFromPkcs8(pkcs8) {
+  const u = (pkcs8 instanceof Uint8Array) ? pkcs8 : new Uint8Array(pkcs8 || []);
+  if (u.length !== ED25519_PKCS8_PREFIX.length + 32) throw new Error('Неверная длина PKCS8');
+  for (let i = 0; i < ED25519_PKCS8_PREFIX.length; i++) {
+    if (u[i] !== ED25519_PKCS8_PREFIX[i]) throw new Error('PKCS8 prefix mismatch');
+  }
+  return u.slice(ED25519_PKCS8_PREFIX.length);
+}
+
+async function deriveKey(pass, saltU8) {
+  const keyMat = await crypto.subtle.importKey('raw', enc.encode(pass), 'PBKDF2', false, ['deriveKey']);
   return crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt, iterations: 120000, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt: saltU8, iterations: 120000, hash: 'SHA-256' },
     keyMat,
     { name: 'AES-GCM', length: 256 },
     false,
     ['encrypt', 'decrypt']
   );
 }
-async function aesEncrypt(aesKey, data) {
+
+async function aesEncrypt(aesKey, plainU8) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = new Uint8Array(
-    await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, data)
-  );
-  return { iv: Array.from(iv), ct: Array.from(ct) };
-}
-async function aesDecrypt(aesKey, iv, ct) {
-  return new Uint8Array(
-    await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: new Uint8Array(iv) },
-      aesKey,
-      new Uint8Array(ct)
-    )
-  );
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, plainU8));
+  return { iv, ct };
 }
 
-// Accounts index
+async function aesDecrypt(aesKey, ivU8, ctU8) {
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivU8 }, aesKey, ctU8);
+  return new Uint8Array(plain);
+}
+
+// ---------- IndexedDB ----------
+let DBP = null;
+function openDb() {
+  if (DBP) return DBP;
+  DBP = new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return DBP;
+}
+
+async function idbGet(key) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readonly');
+    const st = tx.objectStore(STORE);
+    const r = st.get(key);
+    r.onsuccess = () => resolve(r.result || null);
+    r.onerror = () => reject(r.error);
+  });
+}
+async function idbSet(key, val) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    const st = tx.objectStore(STORE);
+    const r = st.put(val, key);
+    r.onsuccess = () => resolve();
+    r.onerror = () => reject(r.error);
+  });
+}
+async function idbDel(key) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    const st = tx.objectStore(STORE);
+    const r = st.delete(key);
+    r.onsuccess = () => resolve();
+    r.onerror = () => reject(r.error);
+  });
+}
+
+async function listAccounts() { return (await idbGet('accounts')) || []; }
 async function addAccount(rid) {
   const list = (await idbGet('accounts')) || [];
   if (!list.includes(rid)) {
@@ -114,69 +185,8 @@ async function addAccount(rid) {
     await idbSet('accounts', list);
   }
 }
-async function listAccounts() {
-  return (await idbGet('accounts')) || [];
-}
 
-// Mnemonic helpers (16 псевдо-слов, seed = SHA-256("logos-lrb-ed25519:"+phrase))
-const MN_WORDS = 16;
-const MN_ALPH  = 'abcdefghjkmnpqrstuvwxyz'; // без легко путаемых символов
-
-function randomWord(len = 5) {
-  const buf = new Uint8Array(len);
-  crypto.getRandomValues(buf);
-  let w = '';
-  for (let i = 0; i < len; i++) {
-    w += MN_ALPH[buf[i] % MN_ALPH.length];
-  }
-  return w;
-}
-
-function generateMnemonic() {
-  const words = [];
-  for (let i = 0; i < MN_WORDS; i++) words.push(randomWord());
-  return words.join(' ');
-}
-
-function normalizeMnemonic(s) {
-  return (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
-}
-
-async function mnemonicToSeedBytes(mnemonic) {
-  const norm = normalizeMnemonic(mnemonic);
-  if (!norm) throw new Error('Резервная фраза пуста');
-  const data = 'logos-lrb-ed25519:' + norm;
-  const hash = await crypto.subtle.digest('SHA-256', enc.encode(data));
-  return new Uint8Array(hash); // 32 байта
-}
-
-// PKCS8 Ed25519 (RFC 8410): 302e020100300506032b657004220420 || seed32
-const ED25519_PKCS8_PREFIX = new Uint8Array([
-  0x30, 0x2e, 0x02, 0x01, 0x00,
-  0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
-  0x04, 0x22, 0x04, 0x20
-]);
-
-function buildPkcs8FromSeed(seed) {
-  if (!(seed instanceof Uint8Array) || seed.length !== 32) {
-    throw new Error('seed должен быть 32 байта');
-  }
-  const outArr = new Uint8Array(ED25519_PKCS8_PREFIX.length + seed.length);
-  outArr.set(ED25519_PKCS8_PREFIX, 0);
-  outArr.set(seed, ED25519_PKCS8_PREFIX.length);
-  return outArr;
-}
-
-function base64urlToBytes(str) {
-  const pad = str.length % 4 === 2 ? '==' : str.length % 4 === 3 ? '=' : '';
-  const b64 = str.replace(/-/g, '+').replace(/_/g, '/') + pad;
-  const bin = atob(b64);
-  const outArr = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) outArr[i] = bin.charCodeAt(i);
-  return outArr;
-}
-
-// Pending state для подтверждения фразы
+// Pending state
 let pendingRid = null;
 let pendingMnemonic = null;
 
@@ -186,34 +196,24 @@ async function createAccount(passRaw) {
 
   out('Создаём ключ и фразу…');
 
-  // 1) фраза и seed
   const mnemonic = generateMnemonic();
-  const seed = await mnemonicToSeedBytes(mnemonic);
+  const seed = await mnemonicToSeed(mnemonic);
   const pkcs8 = buildPkcs8FromSeed(seed);
 
-  // 2) публичный ключ через JWK
-  const privateKey = await crypto.subtle.importKey(
-    'pkcs8',
-    pkcs8,
-    { name: 'Ed25519' },
-    true,
-    ['sign']
-  );
-  const jwk = await crypto.subtle.exportKey('jwk', privateKey);
-  if (!jwk || !jwk.x) throw new Error('Не удалось извлечь публичный ключ');
-  const pubBytes = base64urlToBytes(jwk.x);
-  const rid = b58(pubBytes);
+  const kp = nacl.sign.keyPair.fromSeed(seed);
+  const pub = new Uint8Array(kp.publicKey);
+  const rid = b58encode(pub);
 
-  // 3) шифруем приватник на пароль
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const aes = await deriveKey(pass, salt);
   const { iv, ct } = await aesEncrypt(aes, pkcs8);
+
   const meta = {
     rid,
-    pub: Array.from(pubBytes),
+    pub: Array.from(pub),
     salt: Array.from(salt),
-    iv,
-    priv: ct
+    iv: Array.from(iv),
+    priv: Array.from(ct),
   };
 
   await idbSet('acct:' + rid, meta);
@@ -232,38 +232,38 @@ async function createAccount(passRaw) {
   if (sec && disp && confirm) {
     disp.value = mnemonic;
     confirm.value = '';
-    sec.style.display = 'block';
+    sec.hidden = false;
     sec.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
-  out('RID создан: ' + rid + '. Обязательно запиши фразу выше и подтверди её.');
+  out('RID создан: ' + rid + '. Запиши фразу и подтверди её.');
 }
 
 async function loginAccount(ridRaw, passRaw) {
   ensureEnv();
   const rid = normRid(ridRaw);
   const pass = ensureLoginPassword(passRaw);
-
   if (!rid) throw new Error('Укажи RID');
 
   const meta = await idbGet('acct:' + rid);
   if (!meta) {
     const list = await listAccounts();
-    throw new Error(
-      'RID не найден на этом устройстве. Сохранённые RID:\n' +
-      (list.length ? list.join('\n') : '—')
-    );
+    throw new Error('RID не найден на этом устройстве.\n' + (list.length ? list.join('\n') : '— пусто —'));
   }
-  const aes = await deriveKey(pass, new Uint8Array(meta.salt));
+
+  const aes = await deriveKey(pass, new Uint8Array(meta.salt || []));
   try {
-    await aesDecrypt(aes, meta.iv, meta.priv);
-  } catch (e) {
-    throw new Error('Неверный пароль');
+    const pkcs8 = await aesDecrypt(aes, new Uint8Array(meta.iv || []), new Uint8Array(meta.priv || []));
+    // проверим, что это действительно наш PKCS8 (совместимость/коррупция)
+    extractSeedFromPkcs8(pkcs8);
+  } catch (_) {
+    throw new Error('Неверный пароль или повреждённый ключ');
   }
 
   sessionStorage.setItem('logos_pass', pass);
   sessionStorage.setItem('logos_rid', rid);
   await idbSet('last_rid', rid);
+
   out('Вход…');
   location.href = './app.html';
 }
@@ -274,32 +274,25 @@ async function restoreAccount(mnemonicRaw, passRaw) {
   const mnemonic = normalizeMnemonic(mnemonicRaw);
   if (!mnemonic) throw new Error('Введи резервную фразу');
 
-  out('Восстанавливаем кошелёк из фразы…');
+  out('Восстанавливаем кошелёк…');
 
-  const seed = await mnemonicToSeedBytes(mnemonic);
+  const seed = await mnemonicToSeed(mnemonic);
   const pkcs8 = buildPkcs8FromSeed(seed);
 
-  const privateKey = await crypto.subtle.importKey(
-    'pkcs8',
-    pkcs8,
-    { name: 'Ed25519' },
-    true,
-    ['sign']
-  );
-  const jwk = await crypto.subtle.exportKey('jwk', privateKey);
-  if (!jwk || !jwk.x) throw new Error('Не удалось извлечь публичный ключ');
-  const pubBytes = base64urlToBytes(jwk.x);
-  const rid = b58(pubBytes);
+  const kp = nacl.sign.keyPair.fromSeed(seed);
+  const pub = new Uint8Array(kp.publicKey);
+  const rid = b58encode(pub);
 
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const aes = await deriveKey(pass, salt);
   const { iv, ct } = await aesEncrypt(aes, pkcs8);
+
   const meta = {
     rid,
-    pub: Array.from(pubBytes),
+    pub: Array.from(pub),
     salt: Array.from(salt),
-    iv,
-    priv: ct
+    iv: Array.from(iv),
+    priv: Array.from(ct),
   };
 
   await idbSet('acct:' + rid, meta);
@@ -317,12 +310,12 @@ async function resetAll() {
   const ok = confirm('Точно стереть все локальные аккаунты? Это нельзя отменить.');
   if (!ok) return;
   const list = await listAccounts();
-  for (const rid of list) {
-    await idbDel('acct:' + rid);
-  }
+  for (const rid of list) await idbDel('acct:' + rid);
   await idbDel('accounts');
   await idbDel('last_rid');
   sessionStorage.clear();
+  pendingRid = null;
+  pendingMnemonic = null;
   out('Все аккаунты удалены.');
 }
 
@@ -331,12 +324,16 @@ function renderRidList(list) {
   const ul = $('#ridList');
   if (!wrap || !ul) return;
   ul.innerHTML = '';
-  wrap.style.display = 'block';
+  wrap.hidden = false;
+
   if (!list.length) {
-    ul.innerHTML = '<li>— пусто —</li>';
+    const li = document.createElement('li');
+    li.textContent = '— пусто —';
+    ul.appendChild(li);
     return;
   }
-  list.forEach(rid => {
+
+  for (const rid of list) {
     const li = document.createElement('li');
     li.textContent = rid;
     li.addEventListener('click', () => {
@@ -345,107 +342,82 @@ function renderRidList(list) {
       out('RID подставлен');
     });
     ul.appendChild(li);
-  });
+  }
 }
 
-// авто-подстановка last_rid и скрытие DEV-сброса в проде
+// boot helpers
 (async () => {
   try {
+    // last_rid
     const last = await idbGet('last_rid');
     const loginRid = $('#loginRid');
     if (last && loginRid) loginRid.value = last;
+
+    // DEV reset only on localhost
+    const resetBtn = $('#btn-reset');
+    if (resetBtn) {
+      const isDevHost = (location.hostname === 'localhost' || location.hostname === '127.0.0.1');
+      resetBtn.hidden = !isDevHost;
+    }
   } catch (e) {
     console.error(e);
-  }
-  const resetBtn = $('#btn-reset');
-  if (resetBtn) {
-    const isDevHost = ['localhost', '127.0.0.1'].includes(location.hostname);
-    if (!isDevHost) {
-      resetBtn.style.display = 'none';
-    }
   }
 })();
 
 // UI wiring
-const btnLogin = $('#btn-login');
-if (btnLogin) {
-  btnLogin.addEventListener('click', async () => {
-    const rid  = $('#loginRid')?.value || '';
-    const pass = $('#loginPass')?.value || '';
-    try {
-      await loginAccount(rid, pass);
-    } catch (e) {
-      out('ERR: ' + (e && e.message ? e.message : e));
-    }
-  });
-}
+$('#btn-login')?.addEventListener('click', async () => {
+  try {
+    await loginAccount($('#loginRid')?.value || '', $('#loginPass')?.value || '');
+  } catch (e) {
+    out('ERR: ' + (e && e.message ? e.message : e));
+  }
+});
 
-const btnCreate = $('#btn-create');
-if (btnCreate) {
-  btnCreate.addEventListener('click', async () => {
-    const pass = $('#createPass')?.value || '';
-    try {
-      await createAccount(pass);
-    } catch (e) {
-      out('ERR: ' + (e && e.message ? e.message : e));
-    }
-  });
-}
+$('#btn-create')?.addEventListener('click', async () => {
+  try {
+    await createAccount($('#createPass')?.value || '');
+  } catch (e) {
+    out('ERR: ' + (e && e.message ? e.message : e));
+  }
+});
 
-const btnList = $('#btn-list');
-if (btnList) {
-  btnList.addEventListener('click', async () => {
-    try {
-      renderRidList(await listAccounts());
-    } catch (e) {
-      out('ERR: ' + (e && e.message ? e.message : e));
-    }
-  });
-}
+$('#btn-list')?.addEventListener('click', async () => {
+  try {
+    renderRidList(await listAccounts());
+  } catch (e) {
+    out('ERR: ' + (e && e.message ? e.message : e));
+  }
+});
 
-const btnReset = $('#btn-reset');
-if (btnReset) {
-  btnReset.addEventListener('click', () => {
-    const isDevHost = ['localhost', '127.0.0.1'].includes(location.hostname);
-    if (!isDevHost) {
-      alert('Сброс доступен только на dev-хосте (localhost).');
-      return;
-    }
-    resetAll().catch(e => out('ERR: ' + e));
-  });
-}
+$('#btn-reset')?.addEventListener('click', async () => {
+  const isDevHost = (location.hostname === 'localhost' || location.hostname === '127.0.0.1');
+  if (!isDevHost) {
+    out('ERR: reset доступен только на localhost (dev)');
+    return;
+  }
+  try {
+    await resetAll();
+  } catch (e) {
+    out('ERR: ' + (e && e.message ? e.message : e));
+  }
+});
 
-const btnMnemonicOk = $('#btn-mnemonic-ok');
-if (btnMnemonicOk) {
-  btnMnemonicOk.addEventListener('click', () => {
-    if (!pendingRid || !pendingMnemonic) {
-      out('Нет созданного кошелька для подтверждения');
-      return;
-    }
-    const confirmInput = $('#mnemonicConfirm');
-    const typed = confirmInput ? normalizeMnemonic(confirmInput.value) : '';
-    if (!typed) {
-      out('Повтори фразу для подтверждения');
-      return;
-    }
-    if (typed !== normalizeMnemonic(pendingMnemonic)) {
-      out('Фразы не совпадают. Проверь, что записал всё без ошибок.');
-      return;
-    }
-    out('Фраза подтверждена, вход…');
-    location.href = './app.html';
-  });
-}
+$('#btn-mnemonic-ok')?.addEventListener('click', () => {
+  if (!pendingRid || !pendingMnemonic) {
+    out('Нет созданного кошелька для подтверждения');
+    return;
+  }
+  const typed = normalizeMnemonic($('#mnemonicConfirm')?.value || '');
+  if (!typed) { out('Повтори фразу для подтверждения'); return; }
+  if (typed !== normalizeMnemonic(pendingMnemonic)) { out('Фразы не совпадают'); return; }
+  out('Фраза подтверждена, вход…');
+  location.href = './app.html';
+});
 
-const btnRestore = $('#btn-restore');
-if (btnRestore) {
-  btnRestore.addEventListener('click', async () => {
-    const phrase = $('#restoreMnemonic')?.value || '';
-    const pass   = $('#restorePass')?.value   || '';
-    try {
-      await restoreAccount(phrase, pass);
-    } catch (e) {
-      out('ERR: ' + (e && e.message ? e.message : e));
-    }
-  });
-}
+$('#btn-restore')?.addEventListener('click', async () => {
+  try {
+    await restoreAccount($('#restoreMnemonic')?.value || '', $('#restorePass')?.value || '');
+  } catch (e) {
+    out('ERR: ' + (e && e.message ? e.message : e));
+  }
+});

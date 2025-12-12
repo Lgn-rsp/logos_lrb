@@ -1,0 +1,44 @@
+/* auth page tweaks (theme is in /shared/wallet-theme.css) */
+
+.reveal{display:none}
+
+#mnemonicShow,#mnemonicConfirm,#restoreMnemonic{
+  min-height:110px;
+}
+
+#ridList{
+  list-style:none;
+  padding:0;
+  margin:10px 0 0;
+  display:grid;
+  gap:8px;
+}
+
+#ridList li{
+  padding:10px 12px;
+  border-radius:14px;
+  border:1px solid rgba(255,255,255,.10);
+  background:rgba(0,0,0,.22);
+  cursor:pointer;
+  font-family:var(--mono);
+  font-size:12.5px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+
+#ridList li:hover{
+  border-color:rgba(77,163,255,.35);
+  background:rgba(0,0,0,.28);
+}
+
+#out{
+  min-height:84px;
+}
+
+.hero h1{
+  margin:0 0 6px;
+}
+.hero p{
+  margin:0;
+}

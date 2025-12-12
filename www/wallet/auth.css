@@ -1,0 +1,38 @@
+/* Wallet Auth page tweaks (theme in /shared/wallet-theme.css) */
+
+/* ВАЖНО: hidden управляет видимостью, CSS его не должен ломать */
+[hidden]{ display:none !important; }
+
+/* НЕ ставим display:none на эти блоки! */
+#listWrap{ margin-top:12px; }
+#mnemonicSection{ margin-top:14px; }
+
+#mnemonicShow,#mnemonicConfirm,#restoreMnemonic{ min-height:120px; }
+
+#ridList{
+  list-style:none;
+  padding:0;
+  margin:10px 0 0;
+  display:grid;
+  gap:8px;
+}
+
+#ridList li{
+  padding:10px 12px;
+  border-radius:14px;
+  border:1px solid rgba(255,255,255,.10);
+  background:rgba(0,0,0,.22);
+  cursor:pointer;
+  font-family:var(--mono);
+  font-size:12.5px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+
+#ridList li:hover{
+  border-color:rgba(77,163,255,.35);
+  background:rgba(0,0,0,.28);
+}
+
+#out{ min-height:84px; }
